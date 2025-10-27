@@ -1,0 +1,39 @@
+# Виртуальное окружение Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Сгенерированные изображения
+generated_images/
+!generated_images/README.md
+
+# Конфиденциальные данные
+config.json
+cookies.txt
+
+# База данных статистики
+user_statistics.db
+
+# Временные файлы
+*.tmp
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Ярлыки Windows (опционально)
+*.lnk
+
+
