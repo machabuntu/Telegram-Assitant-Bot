@@ -74,9 +74,13 @@ class TelegramWhisperBot:
             api_config = self.config[api_name]
             provider = api_config.get("provider", "openrouter")
             
-            if provider not in api_config:
-                raise ValueError(f"Провайдер '{provider}' не найден в конфигурации {api_name}")
+            # Получаем все доступные провайдеры (исключая ключ "provider")
+            available_providers = [k for k in api_config.keys() if k != "provider"]
             
+            if provider not in available_providers:
+                raise ValueError(f"Провайдер '{provider}' не найден в конфигурации {api_name}. Доступные провайдеры: {available_providers}")
+            
+            logger.info(f"Использую провайдер '{provider}' для {api_name}")
             return api_config[provider]
         except KeyError as e:
             logger.error(f"Конфигурация {api_name} не найдена: {e}")
@@ -84,6 +88,26 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка при получении конфигурации {api_name}: {e}")
             raise
+    
+    def reload_config(self):
+        """Перезагружает конфигурацию из файла config.json"""
+        try:
+            old_config = self.config.copy()
+            self.config = self.load_config("config.json")
+            logger.info("Конфигурация успешно перезагружена из config.json")
+            
+            # Логируем изменения в провайдерах
+            for api_name in self.config:
+                if api_name.endswith('_api') and isinstance(self.config[api_name], dict):
+                    old_provider = old_config.get(api_name, {}).get("provider", "неизвестно")
+                    new_provider = self.config[api_name].get("provider", "неизвестно")
+                    if old_provider != new_provider:
+                        logger.info(f"Провайдер {api_name}: {old_provider} -> {new_provider}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при перезагрузке конфигурации: {e}")
+            return False
     
     def init_database(self):
         """Инициализирует базу данных для статистики пользователей"""
@@ -297,7 +321,7 @@ class TelegramWhisperBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         await update.message.reply_text(
-            "🤖 Привет! Я AI-ассистент с девятью функциями:\n\n"
+            "🤖 Привет! Я AI-ассистент с десятью функциями:\n\n"
             "📹 **Анализ YouTube видео:**\n"
             "• `/summary <URL_видео>` - создание краткого содержания видео\n\n"
             "🖼️ **Анализ изображений:**\n"
@@ -314,6 +338,8 @@ class TelegramWhisperBot:
             "💰 **Баланс и статистика:**\n"
             "• `/balance` - проверка остатка средств на OpenRouter\n"
             "• `/statistics` - статистика расходов пользователей\n\n"
+            "⚙️ **Управление:**\n"
+            "• `/reload` - перезагрузка конфигурации без перезапуска бота\n\n"
             "Выберите нужную команду для начала работы!"
         )
     
@@ -1336,6 +1362,55 @@ class TelegramWhisperBot:
                 f"❌ Произошла ошибка при получении статистики: {str(e)}"
             )
     
+    async def reload_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /reload - перезагружает конфигурацию бота"""
+        # Проверяем, что сообщение пришло из разрешенного канала
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        
+        try:
+            # Отправляем сообщение о начале перезагрузки
+            processing_msg = await update.message.reply_text(
+                "🔄 Перезагружаю конфигурацию...",
+                reply_to_message_id=update.message.message_id
+            )
+            
+            # Перезагружаем конфигурацию
+            success = self.reload_config()
+            
+            if success:
+                # Получаем информацию о текущих провайдерах
+                providers_info = []
+                for api_name in self.config:
+                    if api_name.endswith('_api') and isinstance(self.config[api_name], dict):
+                        provider = self.config[api_name].get("provider", "неизвестно")
+                        model = self.config[api_name].get(provider, {}).get("model", "неизвестно")
+                        providers_info.append(f"• <b>{api_name.replace('_api', '')}</b>: {provider} ({model})")
+                
+                providers_text = "\n".join(providers_info) if providers_info else "• Нет настроенных API"
+                
+                await self.update_status(
+                    processing_msg,
+                    f"✅ <b>Конфигурация успешно перезагружена!</b>\n\n"
+                    f"📋 <b>Текущие настройки:</b>\n{providers_text}\n\n"
+                    f"🔄 Все команды теперь используют новые настройки."
+                )
+                logger.info("Команда /reload выполнена успешно")
+            else:
+                await self.update_status(
+                    processing_msg,
+                    "❌ <b>Ошибка при перезагрузке конфигурации!</b>\n\n"
+                    "Проверьте файл config.json на наличие ошибок."
+                )
+                logger.error("Команда /reload завершилась с ошибкой")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в команде /reload: {e}")
+            await update.message.reply_text(
+                f"❌ Произошла ошибка при перезагрузке: {str(e)}"
+            )
+    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
         # Сохраняем изображения для последующего использования
@@ -1963,34 +2038,34 @@ class TelegramWhisperBot:
             elif image_data.startswith(b'RIFF') and b'WEBP' in image_data[:20]:
                 mime_type = "image/webp"
             
-            describe_config = self.config["describe_api"]
-            provider = describe_config.get("provider", "grok")
+            # Получаем конфигурацию провайдера
+            api_config = self.get_api_config("describe_api")
+            provider = self.config["describe_api"].get("provider", "grok")
+            
+            logger.info(f"Использую провайдер '{provider}' для описания изображения")
+            logger.info(f"API конфигурация: {api_config}")
             
             if provider == "grok":
                 # Grok не возвращает generation_id
-                return await self._describe_with_grok(image_data, image_base64, mime_type, describe_config)
-            elif provider == "openrouter":
-                # OpenRouter возвращает (description, generation_id)
-                return await self._describe_with_openrouter(image_data, image_base64, mime_type, describe_config)
+                return await self._describe_with_grok(image_data, image_base64, mime_type, api_config)
             else:
-                logger.error(f"Неизвестный провайдер: {provider}")
-                return None
+                # Все остальные провайдеры (openrouter, openrouter_nvidia, etc.) возвращают (description, generation_id)
+                return await self._describe_with_openrouter(image_data, image_base64, mime_type, api_config)
                 
         except Exception as e:
             logger.error(f"Ошибка при описании изображения: {e}")
             return None
     
-    async def _describe_with_grok(self, image_data: bytes, image_base64: str, mime_type: str, describe_config: dict) -> Optional[str]:
+    async def _describe_with_grok(self, image_data: bytes, image_base64: str, mime_type: str, api_config: dict) -> Optional[str]:
         """Описание изображения через Grok API"""
         try:
-            grok_config = describe_config["grok"]
             headers = {
-                "Authorization": f"Bearer {grok_config['key']}",
+                "Authorization": f"Bearer {api_config['key']}",
                 "Content-Type": "application/json"
             }
             
             data = {
-                "model": grok_config["model"],
+                "model": api_config["model"],
                 "messages": [
                     {
                         "role": "user",
@@ -2013,7 +2088,7 @@ class TelegramWhisperBot:
             
             logger.info("Отправляю изображение в Grok API")
             response = requests.post(
-                grok_config["url"],
+                api_config["url"],
                 headers=headers,
                 json=data,
                 timeout=300
@@ -2046,17 +2121,16 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при описании изображения через Grok: {e}")
             return None
     
-    async def _describe_with_openrouter(self, image_data: bytes, image_base64: str, mime_type: str, describe_config: dict) -> Optional[str]:
+    async def _describe_with_openrouter(self, image_data: bytes, image_base64: str, mime_type: str, api_config: dict) -> Optional[str]:
         """Описание изображения через OpenRouter API"""
         try:
-            openrouter_config = describe_config["openrouter"]
             headers = {
-                "Authorization": f"Bearer {openrouter_config['key']}",
+                "Authorization": f"Bearer {api_config['key']}",
                 "Content-Type": "application/json"
             }
             
             data = {
-                "model": openrouter_config["model"],
+                "model": api_config["model"],
                 "messages": [
                     {
                         "role": "user",
@@ -2079,7 +2153,7 @@ class TelegramWhisperBot:
             
             logger.info("Отправляю изображение в OpenRouter API")
             response = requests.post(
-                openrouter_config["url"],
+                api_config["url"],
                 headers=headers,
                 json=data,
                 timeout=300
@@ -2969,6 +3043,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("mergeimage", self.mergeimage_command))
         self.application.add_handler(CommandHandler("balance", self.balance_command))
         self.application.add_handler(CommandHandler("statistics", self.statistics_command))
+        self.application.add_handler(CommandHandler("reload", self.reload_command))
         # Добавляем обработчик для всех сообщений (включая изображения)
         self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
