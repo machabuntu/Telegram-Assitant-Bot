@@ -1477,13 +1477,29 @@ class TelegramWhisperBot:
     
     def is_authorized_channel(self, update: Update) -> bool:
         """Проверяет, разрешен ли канал для использования бота"""
+        # Поддержка как одиночного ID, так и списка ID; а также альтернативного ключа allowed_channel_ids
         allowed_channel_id = self.config.get("allowed_channel_id")
+        allowed_channel_ids = self.config.get("allowed_channel_ids")
         chat_id = update.effective_chat.id
-        
-        if not allowed_channel_id or allowed_channel_id == "YOUR_CHANNEL_ID":
-            return True  # Если не указан канал, разрешаем всем
-        
-        return str(chat_id) == str(allowed_channel_id)
+        chat_id_str = str(chat_id)
+
+        # Если ничего не указано или стоит заглушка — разрешаем всем
+        if (allowed_channel_id is None and allowed_channel_ids is None) or allowed_channel_id == "YOUR_CHANNEL_ID":
+            return True
+
+        # Если указан список ID (в любом ключе)
+        if isinstance(allowed_channel_ids, list):
+            return any(chat_id_str == str(cid) for cid in allowed_channel_ids)
+        if isinstance(allowed_channel_id, list):
+            return any(chat_id_str == str(cid) for cid in allowed_channel_id)
+
+        # Иначе трактуем как одиночное значение
+        if allowed_channel_ids is not None:
+            return chat_id_str == str(allowed_channel_ids)
+        if allowed_channel_id is not None:
+            return chat_id_str == str(allowed_channel_id)
+
+        return True
     
     def convert_cookies_to_utf8(self, cookies_file: str):
         """Конвертирует файл cookies в UTF-8"""

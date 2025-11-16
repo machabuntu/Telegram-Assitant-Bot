@@ -126,7 +126,7 @@ pip install -r requirements.txt
 ```json
 {
     "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
-    "allowed_channel_id": "YOUR_CHANNEL_ID",
+    "allowed_channel_id": ["YOUR_CHANNEL_ID_1", "YOUR_CHANNEL_ID_2"],
     "yt_dlp_path": "venv/Scripts",
     "whisper_path": "venv/Scripts",
     "youtube_cookies": "cookies.txt",
