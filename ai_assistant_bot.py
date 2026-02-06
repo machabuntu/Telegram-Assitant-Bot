@@ -504,8 +504,9 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
-            # Разбиваем длинное сообщение на части
-            full_message = f"📝 **Краткое содержание видео:**\n\n{summary}"
+            # Конвертируем Markdown от Gemini в Telegram HTML
+            summary_html = self.markdown_to_telegram_html(summary)
+            full_message = f"📝 <b>Краткое содержание видео:</b>\n\n{summary_html}"
             message_parts = self.split_message(full_message)
             
             logger.info(f"Длина summary: {len(summary)} символов")
@@ -513,10 +514,21 @@ class TelegramWhisperBot:
             
             for i, part in enumerate(message_parts):
                 logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
-                if i == 0:
-                    await update.message.reply_text(part)
-                else:
-                    await update.message.reply_text(f"📝 **Продолжение ({i+1}/{len(message_parts)}):**\n\n{part}")
+                try:
+                    if i == 0:
+                        await update.message.reply_text(part, parse_mode='HTML')
+                    else:
+                        await update.message.reply_text(
+                            f"📝 <b>Продолжение ({i+1}/{len(message_parts)}):</b>\n\n{part}",
+                            parse_mode='HTML'
+                        )
+                except Exception as html_err:
+                    # Если HTML-парсинг не удался — отправляем как plain text
+                    logger.warning(f"Ошибка HTML parse_mode: {html_err}, отправляю без форматирования")
+                    if i == 0:
+                        await update.message.reply_text(part)
+                    else:
+                        await update.message.reply_text(f"📝 Продолжение ({i+1}/{len(message_parts)}):\n\n{part}")
             
         except Exception as e:
             logger.error(f"Ошибка при обработке видео: {e}")
@@ -2497,6 +2509,84 @@ class TelegramWhisperBot:
             parts.append(current_part.strip())
         
         return parts
+    
+    def markdown_to_telegram_html(self, text: str) -> str:
+        """Конвертирует Markdown-текст (от LLM) в Telegram HTML.
+        
+        Обрабатывает: заголовки (#), жирный (**), курсив (*/_), код (```/`),
+        списки (- / * / 1.), горизонтальные линии (---).
+        Экранирует HTML-сущности (<, >, &).
+        """
+        import html as html_module
+        
+        lines = text.split('\n')
+        result_lines = []
+        in_code_block = False
+        
+        for line in lines:
+            # Обработка блоков кода (```)
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    result_lines.append('</code></pre>')
+                    in_code_block = False
+                else:
+                    result_lines.append('<pre><code>')
+                    in_code_block = True
+                continue
+            
+            if in_code_block:
+                result_lines.append(html_module.escape(line))
+                continue
+            
+            # Экранируем HTML-сущности
+            line = html_module.escape(line)
+            
+            # Горизонтальная линия
+            if re.match(r'^-{3,}$', line.strip()) or re.match(r'^\*{3,}$', line.strip()):
+                result_lines.append('—' * 20)
+                continue
+            
+            # Заголовки: ### → <b>, ## → <b>, # → <b>  (Telegram не поддерживает <h1>)
+            header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if header_match:
+                header_text = header_match.group(2).strip()
+                # Обрабатываем инлайн-форматирование внутри заголовка
+                header_text = self._inline_markdown_to_html(header_text)
+                result_lines.append(f'\n<b>{header_text}</b>')
+                continue
+            
+            # Инлайн-форматирование
+            line = self._inline_markdown_to_html(line)
+            
+            result_lines.append(line)
+        
+        # Если блок кода не был закрыт
+        if in_code_block:
+            result_lines.append('</code></pre>')
+        
+        return '\n'.join(result_lines)
+    
+    def _inline_markdown_to_html(self, text: str) -> str:
+        """Конвертирует инлайн-Markdown в Telegram HTML.
+        
+        Обрабатывает: **bold**, *italic*, __bold__, _italic_, `code`, ~~strikethrough~~
+        """
+        # Жирный + курсив (***text***)
+        text = re.sub(r'\*{3}(.+?)\*{3}', r'<b><i>\1</i></b>', text)
+        # Жирный (**text** или __text__)
+        text = re.sub(r'\*{2}(.+?)\*{2}', r'<b>\1</b>', text)
+        text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+        # Курсив (*text* или _text_), но не внутри слов с подчёркиваниями
+        text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<i>\1</i>', text)
+        text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<i>\1</i>', text)
+        # Зачёркнутый (~~text~~)
+        text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+        # Инлайн-код (`code`)
+        text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+        # Ссылки [text](url) → просто text (Telegram HTML ссылки сложнее)
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+        
+        return text
     
     def escape_markdown_v2(self, text: str) -> str:
         """Экранирует специальные символы для Telegram MarkdownV2
