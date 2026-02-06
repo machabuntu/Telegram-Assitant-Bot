@@ -15,9 +15,10 @@ import sqlite3
 from datetime import datetime
 
 import telegram
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import requests
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -48,6 +49,12 @@ class TelegramWhisperBot:
         # База данных для статистики пользователей
         self.db_path = "user_statistics.db"
         self.init_database()
+        # Список доступных моделей OpenRouter
+        self.available_models = []
+        # Файл для хранения выбранных моделей по chat_id
+        self.selected_models_file = "selected_models.json"
+        # Хранилище выбранных моделей {chat_id: model_id}
+        self.selected_models = self.load_selected_models()
         
     def load_config(self, config_file: str) -> dict:
         """Загружает конфигурацию из JSON файла"""
@@ -150,6 +157,97 @@ class TelegramWhisperBot:
             logger.info("База данных статистики успешно инициализирована")
         except Exception as e:
             logger.error(f"Ошибка при инициализации базы данных: {e}")
+    
+    def load_selected_models(self) -> dict:
+        """Загружает выбранные модели из файла"""
+        try:
+            if os.path.exists(self.selected_models_file):
+                with open(self.selected_models_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Конвертируем ключи обратно в int (JSON хранит их как строки)
+                    return {int(k): v for k, v in data.items()}
+            return {}
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке выбранных моделей: {e}")
+            return {}
+    
+    def save_selected_models(self):
+        """Сохраняет выбранные модели в файл"""
+        try:
+            with open(self.selected_models_file, 'w', encoding='utf-8') as f:
+                json.dump(self.selected_models, f, ensure_ascii=False, indent=2)
+            logger.info("Выбранные модели сохранены")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении выбранных моделей: {e}")
+    
+    def fetch_openrouter_models(self):
+        """Загружает и фильтрует список моделей с OpenRouter API"""
+        try:
+            # Получаем API ключ из конфига
+            api_key = self.config.get("ask_api", {}).get("openrouter", {}).get("key")
+            if not api_key:
+                logger.error("Не найден API ключ OpenRouter для загрузки моделей")
+                return []
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            logger.info("Загружаю список моделей с OpenRouter API...")
+            response = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Ошибка при загрузке моделей: {response.status_code} - {response.text}")
+                return []
+            
+            data = response.json()
+            models_data = data.get("data", [])
+            
+            # Фильтруем модели
+            # created не старше 6 месяцев (в секундах: 6 * 30 * 24 * 60 * 60)
+            six_months_ago = time.time() - (6 * 30 * 24 * 60 * 60)
+            
+            filtered_models = []
+            for model in models_data:
+                model_id = model.get("id", "")
+                created = model.get("created", 0)
+                architecture = model.get("architecture", {})
+                input_modalities = architecture.get("input_modalities", [])
+                output_modalities = architecture.get("output_modalities", [])
+                
+                # Проверяем условия:
+                # 1. created не старше 6 месяцев
+                # 2. input_modalities содержит "text"
+                # 3. output_modalities ТОЛЬКО ["text"] (строго)
+                if (created >= six_months_ago and 
+                    "text" in input_modalities and 
+                    output_modalities == ["text"]):
+                    filtered_models.append({
+                        "id": model_id,
+                        "name": model.get("name", model_id),
+                        "created": created
+                    })
+            
+            # Сортируем по дате создания (новые первые)
+            filtered_models.sort(key=lambda x: x["created"], reverse=True)
+            
+            self.available_models = filtered_models
+            logger.info(f"Загружено {len(filtered_models)} моделей (из {len(models_data)} всего)")
+            return filtered_models
+            
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке моделей с OpenRouter: {e}", exc_info=True)
+            return []
+    
+    async def update_models_periodically(self, context: ContextTypes.DEFAULT_TYPE):
+        """Периодически обновляет список моделей (вызывается job_queue)"""
+        logger.info("Периодическое обновление списка моделей...")
+        self.fetch_openrouter_models()
     
     async def track_generation_cost(self, generation_id: str, user_id: int, username: str, 
                                      first_name: str, last_name: str, command: str):
@@ -321,12 +419,16 @@ class TelegramWhisperBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         await update.message.reply_text(
-            "🤖 Привет! Я AI-ассистент с десятью функциями:\n\n"
+            "🤖 Привет! Я AI-ассистент с тринадцатью функциями:\n\n"
             "📹 **Анализ YouTube видео:**\n"
             "• `/summary <URL_видео>` - создание краткого содержания видео\n\n"
             "🖼️ **Анализ изображений:**\n"
             "• `/describe` - анализ последнего изображения в чате\n"
             "• `/describe <URL_изображения>` - анализ изображения по ссылке\n\n"
+            "💬 **Текстовый чат:**\n"
+            "• `/ask <вопрос>` - отправка текстового запроса в модель\n"
+            "• `/model` - выбор модели для команды /askmodel\n"
+            "• `/askmodel <вопрос>` - запрос в выбранную модель\n\n"
             "🎨 **Генерация изображений:**\n"
             "• `/imagegen <текст>` - генерация изображения по описанию\n"
             "• `/abcgen <тема>` - генерация русской азбуки на заданную тему\n\n"
@@ -522,6 +624,408 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при анализе изображения: {e}")
             await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
+    async def ask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /ask - отправляет текстовый запрос в модель"""
+        # Проверяем, что сообщение пришло из разрешенного канала
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        
+        # Получаем текст сообщения
+        message_text = update.message.text or ""
+        
+        # Извлекаем текст после команды /ask
+        # Поддерживаем мультилайновый ввод
+        # Обрабатываем разные варианты: /ask, /ask@botname, /ask текст
+        if message_text.startswith('/ask'):
+            # Находим конец команды (может быть /ask или /ask@botname)
+            # Ищем пробел или перенос строки после команды
+            command_end = 4  # Длина '/ask'
+            # Проверяем, есть ли @botname
+            if '@' in message_text[4:]:
+                # Находим конец @botname (до пробела или переноса строки)
+                at_pos = message_text.find('@', 4)
+                space_pos = message_text.find(' ', at_pos)
+                newline_pos = message_text.find('\n', at_pos)
+                if space_pos != -1 or newline_pos != -1:
+                    command_end = min([pos for pos in [space_pos, newline_pos] if pos != -1])
+                else:
+                    command_end = len(message_text)
+            
+            # Извлекаем промпт после команды
+            prompt = message_text[command_end:].strip()
+        else:
+            # Если команда была вызвана через context.args (старый способ)
+            if context.args:
+                prompt = ' '.join(context.args)
+            else:
+                await update.message.reply_text(
+                    "❌ Пожалуйста, укажите ваш вопрос после команды /ask\n\n"
+                    "**Примеры использования:**\n"
+                    "• `/ask Как правильно пить пиво?`\n"
+                    "• `/ask` (на новой строке) Ваш вопрос\n"
+                    "• `/ask` (на нескольких строках) Ваш\nвопрос\nна\nнескольких\nстроках"
+                )
+                return
+        
+        # Проверяем, что промпт не пустой
+        if not prompt or not prompt.strip():
+            await update.message.reply_text(
+                "❌ Пожалуйста, укажите ваш вопрос после команды /ask\n\n"
+                "**Примеры использования:**\n"
+                "• `/ask Как правильно пить пиво?`\n"
+                "• `/ask` (на новой строке) Ваш вопрос\n"
+                "• `/ask` (на нескольких строках) Ваш\nвопрос\nна\nнескольких\nстроках"
+            )
+            return
+        
+        logger.info(f"Обработка запроса /ask: {prompt[:100]}...")
+        
+        # Отправляем сообщение о начале обработки
+        processing_msg = await update.message.reply_text("🤖 Обрабатываю ваш запрос...")
+        
+        try:
+            # Получаем конфигурацию API
+            api_config = self.get_api_config("ask_api")
+            
+            # Отправляем запрос в API
+            await self.update_status(processing_msg, "🤖 Отправляю запрос в модель...")
+            result = await self.ask_with_openrouter(prompt, api_config)
+            
+            if not result:
+                await self.update_status(processing_msg, "❌ Ошибка при обработке запроса.")
+                return
+            
+            # Обрабатываем результат
+            response_text, generation_id = result
+            
+            # Отслеживаем стоимость для OpenRouter
+            if generation_id:
+                user = update.effective_user
+                user_id = user.id
+                username = user.username or ""
+                first_name = user.first_name or ""
+                last_name = user.last_name or ""
+                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "ask")
+            
+            # Отправляем результат
+            await self.update_status(processing_msg, "✅ Готово!")
+            
+            # Разбиваем длинное сообщение на части
+            full_message = f"💬 *Ответ:*\n\n{response_text}"
+            message_parts = self.split_message(full_message)
+            
+            logger.info(f"Длина ответа: {len(response_text)} символов")
+            logger.info(f"Количество частей: {len(message_parts)}")
+            
+            for i, part in enumerate(message_parts):
+                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
+                if i == 0:
+                    # Первая часть отправляем как ответ с Markdown
+                    await self.send_markdown_message(update.message, part)
+                else:
+                    # Остальные части отправляем как отдельные сообщения с Markdown
+                    await self.send_markdown_message(update.message, f"💬 *Продолжение ответа ({i+1}/{len(message_parts)}):*\n\n{part}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке запроса /ask: {e}", exc_info=True)
+            await self.update_status(processing_msg, f"❌ Произошла ошибка: {str(e)}")
+    
+    def get_model_keyboard(self, page: int, current_model: str) -> tuple:
+        """Создает клавиатуру с моделями для указанной страницы
+        
+        Returns:
+            tuple: (keyboard, total_pages, start_idx, end_idx)
+        """
+        models_per_page = 10  # Количество моделей на странице
+        total_models = len(self.available_models)
+        total_pages = (total_models + models_per_page - 1) // models_per_page
+        
+        # Ограничиваем страницу допустимым диапазоном
+        page = max(0, min(page, total_pages - 1))
+        
+        start_idx = page * models_per_page
+        end_idx = min(start_idx + models_per_page, total_models)
+        
+        keyboard = []
+        
+        # Добавляем кнопки моделей
+        for idx in range(start_idx, end_idx):
+            model = self.available_models[idx]
+            model_id = model["id"]
+            model_name = model["name"]
+            # Обрезаем название, если слишком длинное
+            display_name = model_name if len(model_name) <= 35 else model_name[:32] + "..."
+            # Добавляем галочку для текущей выбранной модели
+            if model_id == current_model:
+                display_name = f"✅ {display_name}"
+            keyboard.append([InlineKeyboardButton(display_name, callback_data=f"sel:{idx}")])
+        
+        # Добавляем навигационные кнопки
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"pg:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"pg:{page+1}"))
+        
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        return keyboard, total_pages, start_idx, end_idx
+    
+    async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /model - показывает список доступных моделей"""
+        # Проверяем, что сообщение пришло из разрешенного канала
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        
+        chat_id = update.effective_chat.id
+        
+        # Проверяем, есть ли загруженные модели
+        if not self.available_models:
+            await update.message.reply_text("⏳ Загружаю список моделей...")
+            self.fetch_openrouter_models()
+        
+        if not self.available_models:
+            await update.message.reply_text("❌ Не удалось загрузить список моделей. Попробуйте позже.")
+            return
+        
+        # Получаем текущую выбранную модель
+        current_model = self.selected_models.get(chat_id, "")
+        current_model_display = current_model if current_model else "Не выбрана"
+        
+        # Получаем клавиатуру для первой страницы
+        keyboard, total_pages, start_idx, end_idx = self.get_model_keyboard(0, current_model)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"🤖 *Выберите модель для команды /askmodel*\n\n"
+            f"📌 Текущая: `{current_model_display}`\n"
+            f"📊 Всего моделей: {len(self.available_models)}",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        logger.info(f"Отправлен список моделей, страница 1/{total_pages}")
+    
+    async def model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик нажатий на кнопки выбора модели"""
+        query = update.callback_query
+        data = query.data
+        
+        logger.info(f"Получен callback: {data}")
+        
+        if not data:
+            await query.answer()
+            return
+        
+        chat_id = None
+        if query.message and query.message.chat:
+            chat_id = query.message.chat.id
+        elif update.effective_chat:
+            chat_id = update.effective_chat.id
+        
+        if chat_id is None:
+            logger.warning("Не удалось определить chat_id для callback")
+            await query.answer("Ошибка: не удалось определить чат")
+            return
+        
+        # Проверяем, что чат авторизован
+        if not self.is_authorized_channel(update):
+            await query.answer("Доступ запрещен")
+            return
+        
+        # Если список моделей пустой, пробуем загрузить заново
+        if not self.available_models:
+            self.fetch_openrouter_models()
+            if not self.available_models:
+                await query.answer("Ошибка: список моделей пуст")
+                return
+        
+        current_model = self.selected_models.get(chat_id, "")
+        
+        # Обработка нажатия на номер страницы (ничего не делаем)
+        if data == "noop":
+            await query.answer()
+            return
+        
+        # Обработка навигации по страницам
+        if data.startswith("pg:"):
+            try:
+                page = int(data[3:])
+                keyboard, total_pages, _, _ = self.get_model_keyboard(page, current_model)
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                current_model_display = current_model if current_model else "Не выбрана"
+                
+                await query.answer()
+                await query.edit_message_text(
+                    f"🤖 *Выберите модель для команды /askmodel*\n\n"
+                    f"📌 Текущая: `{current_model_display}`\n"
+                    f"📊 Всего моделей: {len(self.available_models)}",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                logger.info(f"Переход на страницу {page+1}/{total_pages}")
+            except Exception as e:
+                logger.error(f"Ошибка при навигации: {e}")
+                await query.answer("Ошибка навигации")
+            return
+        
+        # Обработка выбора модели
+        if data.startswith("sel:"):
+            try:
+                model_idx = int(data[4:])
+                
+                if model_idx < 0 or model_idx >= len(self.available_models):
+                    logger.error(f"Индекс модели вне диапазона: {model_idx}")
+                    await query.answer("Ошибка: модель не найдена")
+                    return
+                
+                model_id = self.available_models[model_idx]["id"]
+                
+                # Сохраняем выбранную модель
+                self.selected_models[chat_id] = model_id
+                self.save_selected_models()
+                
+                logger.info(f"Чат {chat_id} выбрал модель: {model_id}")
+                
+                # Определяем текущую страницу
+                models_per_page = 10
+                current_page = model_idx // models_per_page
+                
+                # Обновляем клавиатуру
+                keyboard, total_pages, _, _ = self.get_model_keyboard(current_page, model_id)
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.answer("✅ Выбрана модель!")
+                # Удаляем меню выбора, чтобы не захламлять чат
+                try:
+                    await query.delete_message()
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить сообщение с меню выбора: {e}")
+                    # Фоллбек: обновляем сообщение, если удалить не получилось
+                    await query.edit_message_text(
+                        f"✅ Модель выбрана: `{model_id}`",
+                        parse_mode='Markdown'
+                    )
+            except Exception as e:
+                logger.error(f"Ошибка при выборе модели: {e}", exc_info=True)
+                await query.answer("Ошибка при выборе модели")
+            return
+        
+        # Неизвестный callback
+        logger.warning(f"Неизвестный callback_data: {data}")
+        await query.answer()
+    
+    async def askmodel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /askmodel - отправляет запрос в выбранную модель"""
+        # Проверяем, что сообщение пришло из разрешенного канала
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        
+        chat_id = update.effective_chat.id
+        
+        # Проверяем, выбрана ли модель
+        if chat_id not in self.selected_models:
+            await update.message.reply_text(
+                "❌ Модель не выбрана!\n\n"
+                "Используйте команду /model чтобы выбрать модель для запросов."
+            )
+            return
+        
+        selected_model = self.selected_models[chat_id]
+        
+        # Получаем текст сообщения
+        message_text = update.message.text or ""
+        
+        # Извлекаем текст после команды /askmodel
+        # Поддерживаем мультилайновый ввод
+        if message_text.startswith('/askmodel'):
+            command_end = 9  # Длина '/askmodel'
+            if '@' in message_text[9:]:
+                at_pos = message_text.find('@', 9)
+                space_pos = message_text.find(' ', at_pos)
+                newline_pos = message_text.find('\n', at_pos)
+                if space_pos != -1 or newline_pos != -1:
+                    command_end = min([pos for pos in [space_pos, newline_pos] if pos != -1])
+                else:
+                    command_end = len(message_text)
+            prompt = message_text[command_end:].strip()
+        else:
+            if context.args:
+                prompt = ' '.join(context.args)
+            else:
+                await update.message.reply_text(
+                    "❌ Пожалуйста, укажите ваш вопрос после команды /askmodel\n\n"
+                    f"📌 Текущая модель: `{selected_model}`\n\n"
+                    "**Примеры использования:**\n"
+                    "• `/askmodel Как правильно пить пиво?`",
+                    parse_mode='Markdown'
+                )
+                return
+        
+        if not prompt or not prompt.strip():
+            await update.message.reply_text(
+                "❌ Пожалуйста, укажите ваш вопрос после команды /askmodel\n\n"
+                f"📌 Текущая модель: `{selected_model}`",
+                parse_mode='Markdown'
+            )
+            return
+        
+        logger.info(f"Обработка запроса /askmodel (модель: {selected_model}): {prompt[:100]}...")
+        
+        # Отправляем сообщение о начале обработки
+        processing_msg = await update.message.reply_text(f"🤖 Отправляю запрос в модель `{selected_model}`...", parse_mode='Markdown')
+        
+        try:
+            # Получаем базовую конфигурацию API и заменяем модель
+            api_config = self.get_api_config("ask_api").copy()
+            api_config["model"] = selected_model
+            
+            # Отправляем запрос в API
+            await self.update_status(processing_msg, f"🤖 Ожидаю ответ от `{selected_model}`...")
+            result = await self.ask_with_openrouter(prompt, api_config)
+            
+            if not result:
+                await self.update_status(processing_msg, "❌ Ошибка при обработке запроса.")
+                return
+            
+            # Обрабатываем результат
+            response_text, generation_id = result
+            
+            # Отслеживаем стоимость для OpenRouter
+            if generation_id:
+                user = update.effective_user
+                user_id = user.id
+                username = user.username or ""
+                first_name = user.first_name or ""
+                last_name = user.last_name or ""
+                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "askmodel")
+            
+            # Отправляем результат
+            await self.update_status(processing_msg, "✅ Готово!")
+            
+            # Разбиваем длинное сообщение на части
+            full_message = f"💬 *Ответ от* `{selected_model}`:\n\n{response_text}"
+            message_parts = self.split_message(full_message)
+            
+            logger.info(f"Длина ответа: {len(response_text)} символов")
+            logger.info(f"Количество частей: {len(message_parts)}")
+            
+            for i, part in enumerate(message_parts):
+                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
+                if i == 0:
+                    await self.send_markdown_message(update.message, part)
+                else:
+                    await self.send_markdown_message(update.message, f"💬 *Продолжение ответа ({i+1}/{len(message_parts)}):*\n\n{part}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке запроса /askmodel: {e}", exc_info=True)
+            await self.update_status(processing_msg, f"❌ Произошла ошибка: {str(e)}")
+    
     async def imagegen_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /imagegen"""
         # Проверяем, что сообщение пришло из разрешенного канала
@@ -653,7 +1157,7 @@ class TelegramWhisperBot:
         # Объединяем все аргументы в одну строку
         user_prompt = ' '.join(context.args)
         # Формируем полный промпт с инструкцией
-        full_prompt = f'Нарисуй русскую азбуку "{user_prompt}" с заголовком и подписями. Perform a slight zoom out on this image to fix the cropped borders.'
+        full_prompt = f'Нарисуй русскую азбуку "{user_prompt}" с заголовком и подписями. Avoid cropped borders. Content should correctly fit into the picture.'
         logger.info(f"Генерация русской азбуки по запросу: {user_prompt}")
         
         try:
@@ -1420,23 +1924,52 @@ class TelegramWhisperBot:
             # Инициализируем список для множественных изображений
             multiple_images = []
             
-            if update.message.photo:
-                # Сохраняем фото с максимальным разрешением
-                photo = update.message.photo[-1]
-                file = await context.bot.get_file(photo.file_id)
-                image_data = await file.download_as_bytearray()
-                image_bytes = bytes(image_data)
-                self.last_images[chat_id] = image_bytes
-                multiple_images.append(image_bytes)
-                logger.info(f"Сохранено изображение для чата {chat_id}")
-            elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'):
-                # Сохраняем документ-изображение
-                file = await context.bot.get_file(update.message.document.file_id)
-                image_data = await file.download_as_bytearray()
-                image_bytes = bytes(image_data)
-                self.last_images[chat_id] = image_bytes
-                multiple_images.append(image_bytes)
-                logger.info(f"Сохранено изображение-документ для чата {chat_id}")
+            try:
+                if update.message.photo:
+                    # Сохраняем фото с максимальным разрешением
+                    photo = update.message.photo[-1]
+                    try:
+                        # Добавляем таймаут для загрузки файла (60 секунд)
+                        file = await asyncio.wait_for(
+                            context.bot.get_file(photo.file_id),
+                            timeout=60.0
+                        )
+                        image_data = await asyncio.wait_for(
+                            file.download_as_bytearray(),
+                            timeout=120.0  # 2 минуты на загрузку больших файлов
+                        )
+                        image_bytes = bytes(image_data)
+                        self.last_images[chat_id] = image_bytes
+                        multiple_images.append(image_bytes)
+                        logger.info(f"Сохранено изображение для чата {chat_id}, размер: {len(image_bytes)} байт")
+                    except asyncio.TimeoutError:
+                        logger.error(f"Таймаут при загрузке изображения для чата {chat_id}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при загрузке изображения для чата {chat_id}: {e}", exc_info=True)
+                elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('image/'):
+                    # Сохраняем документ-изображение
+                    try:
+                        # Добавляем таймаут для загрузки файла (60 секунд)
+                        file = await asyncio.wait_for(
+                            context.bot.get_file(update.message.document.file_id),
+                            timeout=60.0
+                        )
+                        image_data = await asyncio.wait_for(
+                            file.download_as_bytearray(),
+                            timeout=120.0  # 2 минуты на загрузку больших файлов
+                        )
+                        image_bytes = bytes(image_data)
+                        self.last_images[chat_id] = image_bytes
+                        multiple_images.append(image_bytes)
+                        logger.info(f"Сохранено изображение-документ для чата {chat_id}, размер: {len(image_bytes)} байт")
+                    except asyncio.TimeoutError:
+                        logger.error(f"Таймаут при загрузке изображения-документа для чата {chat_id}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при загрузке изображения-документа для чата {chat_id}: {e}", exc_info=True)
+            except Exception as e:
+                # Логируем общую ошибку, но не отправляем сообщение пользователю
+                # так как это может быть просто загрузка изображения без команды
+                logger.error(f"Неожиданная ошибка при обработке сообщения с изображением для чата {chat_id}: {e}", exc_info=True)
             
             # Проверяем media_group_id для группы изображений
             if update.message.media_group_id:
@@ -1462,6 +1995,15 @@ class TelegramWhisperBot:
         # Если сообщение начинается с /describe, но не обработалось как команда
         elif update.message and update.message.text and update.message.text.startswith('/describe'):
             await self.describe_command(update, context)
+        # Если сообщение начинается с /askmodel, но не обработалось как команда (проверяем ДО /ask!)
+        elif update.message and update.message.text and update.message.text.startswith('/askmodel'):
+            await self.askmodel_command(update, context)
+        # Если сообщение начинается с /ask, но не обработалось как команда
+        elif update.message and update.message.text and update.message.text.startswith('/ask'):
+            await self.ask_command(update, context)
+        # Если сообщение начинается с /model, но не обработалось как команда
+        elif update.message and update.message.text and update.message.text.startswith('/model'):
+            await self.model_command(update, context)
         # Если сообщение начинается с /imagegen, но не обработалось как команда
         elif update.message and update.message.text and update.message.text.startswith('/imagegen'):
             await self.imagegen_command(update, context)
@@ -1957,6 +2499,50 @@ class TelegramWhisperBot:
         
         return parts
     
+    def escape_markdown_v2(self, text: str) -> str:
+        """Экранирует специальные символы для Telegram MarkdownV2
+        
+        Сохраняет базовое форматирование: **bold**, *italic*, `code`, ```code blocks```
+        Экранирует остальные специальные символы.
+        """
+        # Символы, которые нужно экранировать в MarkdownV2
+        # Но мы сохраняем *, `, чтобы форматирование работало
+        escape_chars = ['_', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        
+        result = text
+        for char in escape_chars:
+            result = result.replace(char, f'\\{char}')
+        
+        return result
+    
+    async def send_markdown_message(self, message, text: str, reply_to_message_id: int = None):
+        """Отправляет сообщение с поддержкой Markdown
+        
+        Пробует отправить с Markdown, при ошибке - без форматирования.
+        
+        Args:
+            message: Объект сообщения для ответа
+            text: Текст сообщения
+            reply_to_message_id: ID сообщения для ответа (опционально)
+        """
+        try:
+            # Пробуем отправить с Markdown (старый формат, более лояльный к ошибкам)
+            if reply_to_message_id:
+                return await message.reply_text(text, parse_mode='Markdown', reply_to_message_id=reply_to_message_id)
+            else:
+                return await message.reply_text(text, parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке с Markdown: {e}, отправляю без форматирования")
+            try:
+                # Если Markdown не сработал, пробуем без форматирования
+                if reply_to_message_id:
+                    return await message.reply_text(text, reply_to_message_id=reply_to_message_id)
+                else:
+                    return await message.reply_text(text)
+            except Exception as e2:
+                logger.error(f"Ошибка при отправке сообщения: {e2}")
+                raise
+    
     def is_image_url(self, url: str) -> bool:
         """Проверяет, является ли URL ссылкой на изображение"""
         try:
@@ -2013,24 +2599,50 @@ class TelegramWhisperBot:
                 message = update.message
                 if message.photo:
                     # Получаем фото с максимальным разрешением
-                    photo = message.photo[-1]
-                    file = await context.bot.get_file(photo.file_id)
-                    image_data = await file.download_as_bytearray()
-                    logger.info(f"Найдено изображение в текущем сообщении от {message.from_user.username if message.from_user.username else 'Unknown'}")
-                    return bytes(image_data)
+                    try:
+                        photo = message.photo[-1]
+                        file = await asyncio.wait_for(
+                            context.bot.get_file(photo.file_id),
+                            timeout=60.0
+                        )
+                        image_data = await asyncio.wait_for(
+                            file.download_as_bytearray(),
+                            timeout=120.0
+                        )
+                        logger.info(f"Найдено изображение в текущем сообщении от {message.from_user.username if message.from_user.username else 'Unknown'}")
+                        return bytes(image_data)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Таймаут при загрузке изображения для чата {chat_id}")
+                        return None
+                    except Exception as e:
+                        logger.error(f"Ошибка при загрузке изображения для чата {chat_id}: {e}")
+                        return None
                 elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
                     # Получаем документ-изображение
-                    file = await context.bot.get_file(message.document.file_id)
-                    image_data = await file.download_as_bytearray()
-                    logger.info(f"Найдено изображение-документ в текущем сообщении от {message.from_user.username if message.from_user.username else 'Unknown'}")
-                    return bytes(image_data)
+                    try:
+                        file = await asyncio.wait_for(
+                            context.bot.get_file(message.document.file_id),
+                            timeout=60.0
+                        )
+                        image_data = await asyncio.wait_for(
+                            file.download_as_bytearray(),
+                            timeout=120.0
+                        )
+                        logger.info(f"Найдено изображение-документ в текущем сообщении от {message.from_user.username if message.from_user.username else 'Unknown'}")
+                        return bytes(image_data)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Таймаут при загрузке изображения-документа для чата {chat_id}")
+                        return None
+                    except Exception as e:
+                        logger.error(f"Ошибка при загрузке изображения-документа для чата {chat_id}: {e}")
+                        return None
             
             # Если изображений не найдено
             logger.warning(f"В чате {chat_id} не найдено изображений")
             return None
             
         except Exception as e:
-            logger.error(f"Ошибка при получении последнего изображения: {e}")
+            logger.error(f"Ошибка при получении последнего изображения: {e}", exc_info=True)
             return None
     
     async def describe_image_with_ai(self, image_data: bytes):
@@ -2217,6 +2829,80 @@ class TelegramWhisperBot:
                 
         except Exception as e:
             logger.error(f"Ошибка при описании изображения через OpenRouter: {e}")
+            return None
+    
+    async def ask_with_openrouter(self, prompt: str, api_config: dict) -> Optional[tuple]:
+        """Отправляет текстовый запрос в OpenRouter API
+        
+        Args:
+            prompt: Текстовый запрос пользователя
+            api_config: Конфигурация API
+            
+        Returns:
+            tuple: (response_text, generation_id) или None в случае ошибки
+        """
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_config['key']}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "model": api_config["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            }
+            
+            logger.info(f"Отправляю текстовый запрос в OpenRouter API (модель: {api_config['model']})")
+            response = requests.post(
+                api_config["url"],
+                headers=headers,
+                json=data,
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                content_type = response.headers.get('content-type', '')
+                logger.info(f"Content-Type ответа OpenRouter API (ask): {content_type}")
+                
+                raw_response = response.text
+                
+                if not raw_response or len(raw_response.strip()) == 0:
+                    logger.error("Получен пустой ответ от OpenRouter API (ask)")
+                    return None
+                
+                logger.info(f"Сырой ответ OpenRouter API (ask, длина: {len(raw_response)}): {raw_response[:500]}...")
+                
+                if 'application/json' not in content_type.lower():
+                    logger.error(f"Получен не-JSON ответ от OpenRouter API. Content-Type: {content_type}")
+                    logger.error(f"Полный ответ: {raw_response}")
+                    return None
+                
+                try:
+                    result = response.json()
+                    logger.info(f"Ответ OpenRouter API (ask): {result}")
+                    response_text = result['choices'][0]['message']['content']
+                    generation_id = self.get_generation_id_from_response(result)
+                    logger.info("Текстовый ответ успешно получен через OpenRouter")
+                    return (response_text, generation_id)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Ошибка парсинга JSON от OpenRouter API (ask): {e}")
+                    logger.error(f"Полный сырой ответ: {raw_response}")
+                    return None
+                except (KeyError, IndexError) as e:
+                    logger.error(f"Неожиданная структура ответа от OpenRouter API (ask): {e}")
+                    logger.error(f"Структура ответа: {result}")
+                    return None
+            else:
+                logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Ошибка при отправке текстового запроса через OpenRouter: {e}", exc_info=True)
             return None
     
     def _check_api_response_error(self, result: dict):
@@ -3052,6 +3738,9 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("summary", self.summary_command))
         self.application.add_handler(CommandHandler("describe", self.describe_command))
+        self.application.add_handler(CommandHandler("ask", self.ask_command))
+        self.application.add_handler(CommandHandler("model", self.model_command))
+        self.application.add_handler(CommandHandler("askmodel", self.askmodel_command))
         self.application.add_handler(CommandHandler("imagegen", self.imagegen_command))
         self.application.add_handler(CommandHandler("abcgen", self.abcgen_command))
         self.application.add_handler(CommandHandler("imagechange", self.imagechange_command))
@@ -3060,6 +3749,9 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("balance", self.balance_command))
         self.application.add_handler(CommandHandler("statistics", self.statistics_command))
         self.application.add_handler(CommandHandler("reload", self.reload_command))
+        # Добавляем обработчик для callback кнопок (выбор модели и навигация)
+        # Без pattern, чтобы не пропускать неожиданные callback_data и упростить отладку
+        self.application.add_handler(CallbackQueryHandler(self.model_callback))
         # Добавляем обработчик для всех сообщений (включая изображения)
         self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
@@ -3068,7 +3760,38 @@ class TelegramWhisperBot:
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
-        logger.error(f"Ошибка при обработке обновления: {context.error}")
+        error = context.error
+        logger.error(f"Ошибка при обработке обновления: {error}", exc_info=error)
+        
+        # Проверяем, является ли это ошибкой загрузки файла или таймаутом
+        is_timeout_error = isinstance(error, (asyncio.TimeoutError, TimeoutError))
+        error_str = str(error).lower() if error else ""
+        is_file_download_error = (
+            is_timeout_error or
+            'timeout' in error_str or
+            'download' in error_str or
+            'connection' in error_str
+        )
+        
+        # Проверяем, является ли сообщение просто изображением без команды
+        is_image_only = False
+        if update and update.effective_message:
+            has_image = (
+                update.effective_message.photo or 
+                (update.effective_message.document and 
+                 update.effective_message.document.mime_type and 
+                 update.effective_message.document.mime_type.startswith('image/'))
+            )
+            has_command = (
+                update.effective_message.text and 
+                update.effective_message.text.startswith('/')
+            )
+            is_image_only = has_image and not has_command
+        
+        # Не отправляем сообщение об ошибке, если это просто загрузка изображения с ошибкой загрузки
+        if is_file_download_error and is_image_only:
+            logger.info("Пропускаем отправку сообщения об ошибке для простой загрузки изображения (таймаут или ошибка загрузки)")
+            return
         
         # Отправляем сообщение об ошибке пользователю, если это возможно
         if update and update.effective_message:
@@ -3094,12 +3817,33 @@ class TelegramWhisperBot:
             except Exception as e:
                 logger.warning(f"Не удалось удалить webhook: {e}")
             
+            # Загружаем список моделей при старте
+            logger.info("Загружаю список моделей OpenRouter...")
+            self.fetch_openrouter_models()
+            
             # Настраиваем обработчики
             self.setup_handlers()
             
+            # Добавляем периодическую задачу обновления моделей (каждые 6 часов)
+            # job_queue может быть None, если не установлен пакет python-telegram-bot[job-queue]
+            job_queue = self.application.job_queue
+            if job_queue is not None:
+                job_queue.run_repeating(
+                    self.update_models_periodically,
+                    interval=6 * 60 * 60,  # 6 часов в секундах
+                    first=6 * 60 * 60  # Первый запуск через 6 часов (уже загрузили при старте)
+                )
+                logger.info("Периодическое обновление моделей настроено (каждые 6 часов)")
+            else:
+                logger.warning("JobQueue не доступен. Для периодического обновления моделей установите: pip install 'python-telegram-bot[job-queue]'")
+            
             # Запускаем бота
             logger.info("Запускаю Telegram бота...")
-            self.application.run_polling(stop_signals=None, drop_pending_updates=True)
+            self.application.run_polling(
+                stop_signals=None,
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
         except KeyboardInterrupt:
             logger.info("Получен сигнал остановки")
         except Exception as e:
