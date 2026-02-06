@@ -446,7 +446,7 @@ class TelegramWhisperBot:
         )
     
     async def summary_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /summary"""
+        """Обработчик команды /summary — создаёт краткое содержание YouTube-видео через Google Gemini"""
         # Проверяем, что сообщение пришло из разрешенного канала
         if not self.is_authorized_channel(update):
             await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
@@ -458,44 +458,50 @@ class TelegramWhisperBot:
             return
         
         youtube_url = context.args[0]
-        logger.info(f"Обработка видео: {youtube_url}")
+        logger.info(f"Обработка видео через Gemini: {youtube_url}")
         
         # Отправляем сообщение о начале обработки с цитированием
         processing_msg = await update.message.reply_text(
-            "🔄 Начинаю обработку видео...",
+            "🔄 Отправляю видео в Google Gemini для анализа...",
             reply_to_message_id=update.message.message_id
         )
         
         try:
-            # Шаг 1: Скачиваем аудио с помощью yt-dlp
-            await self.update_status(processing_msg, "📥 Скачиваю аудио с YouTube...")
-            audio_file = await self.download_audio(youtube_url)
+            api_config = self.get_api_config("summary_api")
+            provider = self.config["summary_api"].get("provider", "google")
             
-            if not audio_file:
-                await self.update_status(processing_msg, "❌ Ошибка при скачивании аудио. Проверьте URL видео.")
-                return
-            
-            # Шаг 2: Обрабатываем аудио через Whisper с прогрессом
-            await self.update_status(processing_msg, "🎤 Создаю транскрипт...")
-            transcript = await self.transcribe_audio_with_progress(audio_file, processing_msg)
-            
-            if not transcript:
-                await self.update_status(processing_msg, "❌ Ошибка при создании транскрипта.")
-                return
-            
-            # Шаг 2.5: Очищаем транскрипт
-            await self.update_status(processing_msg, "🧹 Очищаю транскрипт...")
-            cleaned_transcript = self.clean_transcript(transcript)
-            
-            # Шаг 3: Создаем summary через Grok API
-            await self.update_status(processing_msg, "🤖 Генерирую summary...")
-            summary = await self.create_summary(cleaned_transcript)
+            if provider == "google":
+                # Новый путь: напрямую передаём YouTube URL в Gemini
+                await self.update_status(processing_msg, "🤖 Gemini анализирует видео...")
+                summary = await self.create_summary_with_gemini(youtube_url, api_config)
+            else:
+                # Старый путь через скачивание + транскрипцию + LLM (для grok/openrouter)
+                await self.update_status(processing_msg, "📥 Скачиваю аудио с YouTube...")
+                audio_file = await self.download_audio(youtube_url)
+                if not audio_file:
+                    await self.update_status(processing_msg, "❌ Ошибка при скачивании аудио. Проверьте URL видео.")
+                    return
+                
+                await self.update_status(processing_msg, "🎤 Создаю транскрипт...")
+                transcript = await self.transcribe_audio_with_progress(audio_file, processing_msg)
+                if not transcript:
+                    await self.update_status(processing_msg, "❌ Ошибка при создании транскрипта.")
+                    return
+                
+                await self.update_status(processing_msg, "🧹 Очищаю транскрипт...")
+                cleaned_transcript = self.clean_transcript(transcript)
+                
+                await self.update_status(processing_msg, "🤖 Генерирую summary...")
+                summary = await self.create_summary(cleaned_transcript)
+                
+                # Очищаем временные файлы после старого пути
+                await self.cleanup_temp_files()
             
             if not summary:
                 await self.update_status(processing_msg, "❌ Ошибка при создании summary.")
                 return
             
-            # Шаг 4: Отправляем результат
+            # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
             # Разбиваем длинное сообщение на части
@@ -503,25 +509,18 @@ class TelegramWhisperBot:
             message_parts = self.split_message(full_message)
             
             logger.info(f"Длина summary: {len(summary)} символов")
-            logger.info(f"Длина полного сообщения: {len(full_message)} символов")
             logger.info(f"Количество частей: {len(message_parts)}")
             
             for i, part in enumerate(message_parts):
                 logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
                 if i == 0:
-                    # Первая часть отправляем как ответ
                     await update.message.reply_text(part)
                 else:
-                    # Остальные части отправляем как отдельные сообщения
                     await update.message.reply_text(f"📝 **Продолжение ({i+1}/{len(message_parts)}):**\n\n{part}")
             
         except Exception as e:
             logger.error(f"Ошибка при обработке видео: {e}")
             await self.update_status(processing_msg, f"❌ Произошла ошибка: {str(e)}")
-        
-        finally:
-            # Очищаем временные файлы
-            await self.cleanup_temp_files()
     
     async def update_status(self, message, status_text):
         """Обновляет статус обработки"""
@@ -3721,6 +3720,98 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при создании summary: {e}")
+            return None
+    
+    async def create_summary_with_gemini(self, youtube_url: str, api_config: dict) -> Optional[str]:
+        """Создаёт summary YouTube-видео напрямую через Google Gemini API.
+        
+        Gemini принимает YouTube URL через file_data.file_uri и самостоятельно
+        анализирует аудио и видеоряд — без необходимости скачивать и транскрибировать.
+        
+        Args:
+            youtube_url: Ссылка на YouTube-видео
+            api_config: Конфигурация Google Gemini API (url, key, model)
+        
+        Returns:
+            str: Текст summary или None в случае ошибки
+        """
+        try:
+            model = api_config["model"]
+            api_key = api_config["key"]
+            base_url = api_config.get("url", "https://generativelanguage.googleapis.com/v1beta")
+            
+            url = f"{base_url}/models/{model}:generateContent"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key
+            }
+            
+            data = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "file_data": {
+                                    "file_uri": youtube_url
+                                }
+                            },
+                            {
+                                "text": (
+                                    "Ты — помощник, который создаёт развёрнутые и информативные summary "
+                                    "для YouTube-видео. Создай структурированное краткое содержание на "
+                                    "русском языке, выделив основные темы и ключевые моменты. "
+                                    "Опускай рекламу, если обнаружишь её в содержании. "
+                                    "Если в речи есть ошибки или неточности, исправляй их, "
+                                    "но не упоминай об этом в summary."
+                                )
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.7
+                }
+            }
+            
+            logger.info(f"Отправляю YouTube URL в Google Gemini API (модель: {model}): {youtube_url}")
+            response = requests.post(url, headers=headers, json=data, timeout=600)  # 10 минут — видео может быть длинным
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Ответ Gemini API получен")
+                
+                candidates = result.get("candidates", [])
+                if not candidates:
+                    # Проверяем promptFeedback на блокировку
+                    feedback = result.get("promptFeedback", {})
+                    block_reason = feedback.get("blockReason", "")
+                    if block_reason:
+                        logger.error(f"Запрос заблокирован Gemini: {block_reason}")
+                        return None
+                    logger.error(f"Пустой ответ от Gemini API: {result}")
+                    return None
+                
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text_parts = [p["text"] for p in parts if "text" in p]
+                summary = "\n".join(text_parts)
+                
+                if summary:
+                    logger.info(f"Summary успешно создан через Google Gemini ({len(summary)} символов)")
+                    return summary
+                else:
+                    logger.error("Gemini вернул ответ без текста")
+                    return None
+            else:
+                error_text = response.text
+                logger.error(f"Ошибка Google Gemini API: {response.status_code} - {error_text}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logger.error("Таймаут при запросе к Google Gemini API (видео слишком длинное?)")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка при создании summary через Gemini: {e}")
             return None
     
     async def cleanup_temp_files(self):
