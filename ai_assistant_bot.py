@@ -504,31 +504,11 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
-            # Конвертируем Markdown от Gemini в Telegram HTML
-            summary_html = self.markdown_to_telegram_html(summary)
-            full_message = f"📝 <b>Краткое содержание видео:</b>\n\n{summary_html}"
-            message_parts = self.split_message(full_message)
-            
-            logger.info(f"Длина summary: {len(summary)} символов")
-            logger.info(f"Количество частей: {len(message_parts)}")
-            
-            for i, part in enumerate(message_parts):
-                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
-                try:
-                    if i == 0:
-                        await update.message.reply_text(part, parse_mode='HTML')
-                    else:
-                        await update.message.reply_text(
-                            f"📝 <b>Продолжение ({i+1}/{len(message_parts)}):</b>\n\n{part}",
-                            parse_mode='HTML'
-                        )
-                except Exception as html_err:
-                    # Если HTML-парсинг не удался — отправляем как plain text
-                    logger.warning(f"Ошибка HTML parse_mode: {html_err}, отправляю без форматирования")
-                    if i == 0:
-                        await update.message.reply_text(part)
-                    else:
-                        await update.message.reply_text(f"📝 Продолжение ({i+1}/{len(message_parts)}):\n\n{part}")
+            await self.send_ai_response(
+                update.message, summary,
+                header="📝 <b>Краткое содержание видео:</b>",
+                continuation_header="Продолжение"
+            )
             
         except Exception as e:
             logger.error(f"Ошибка при обработке видео: {e}")
@@ -615,21 +595,11 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
-            # Разбиваем длинное сообщение на части
-            full_message = f"🖼️ **Описание изображения:**\n\n{description}"
-            message_parts = self.split_message(full_message)
-            
-            logger.info(f"Длина описания: {len(description)} символов")
-            logger.info(f"Количество частей: {len(message_parts)}")
-            
-            for i, part in enumerate(message_parts):
-                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
-                if i == 0:
-                    # Первая часть отправляем как ответ
-                    await update.message.reply_text(part)
-                else:
-                    # Остальные части отправляем как отдельные сообщения
-                    await update.message.reply_text(f"🖼️ **Продолжение описания ({i+1}/{len(message_parts)}):**\n\n{part}")
+            await self.send_ai_response(
+                update.message, description,
+                header="🖼️ <b>Описание изображения:</b>",
+                continuation_header="Продолжение описания"
+            )
             
         except Exception as e:
             logger.error(f"Ошибка при анализе изображения: {e}")
@@ -722,21 +692,11 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
-            # Разбиваем длинное сообщение на части
-            full_message = f"💬 *Ответ:*\n\n{response_text}"
-            message_parts = self.split_message(full_message)
-            
-            logger.info(f"Длина ответа: {len(response_text)} символов")
-            logger.info(f"Количество частей: {len(message_parts)}")
-            
-            for i, part in enumerate(message_parts):
-                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
-                if i == 0:
-                    # Первая часть отправляем как ответ с Markdown
-                    await self.send_markdown_message(update.message, part)
-                else:
-                    # Остальные части отправляем как отдельные сообщения с Markdown
-                    await self.send_markdown_message(update.message, f"💬 *Продолжение ответа ({i+1}/{len(message_parts)}):*\n\n{part}")
+            await self.send_ai_response(
+                update.message, response_text,
+                header="💬 <b>Ответ:</b>",
+                continuation_header="Продолжение ответа"
+            )
             
         except Exception as e:
             logger.error(f"Ошибка при обработке запроса /ask: {e}", exc_info=True)
@@ -1019,20 +979,14 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
             
-            # Разбиваем длинное сообщение на части
-            full_message = f"💬 *Ответ от* `{selected_model}`:\n\n{response_text}"
-            message_parts = self.split_message(full_message)
-            
-            logger.info(f"Длина ответа: {len(response_text)} символов")
-            logger.info(f"Количество частей: {len(message_parts)}")
-            
-            for i, part in enumerate(message_parts):
-                logger.info(f"Отправляю часть {i+1}/{len(message_parts)}, длина: {len(part)} символов")
-                if i == 0:
-                    await self.send_markdown_message(update.message, part)
-                else:
-                    await self.send_markdown_message(update.message, f"💬 *Продолжение ответа ({i+1}/{len(message_parts)}):*\n\n{part}")
-            
+            import html as html_module
+            safe_model = html_module.escape(selected_model)
+            await self.send_ai_response(
+                update.message, response_text,
+                header=f"💬 <b>Ответ от</b> <code>{safe_model}</code><b>:</b>",
+                continuation_header="Продолжение ответа"
+            )
+
         except Exception as e:
             logger.error(f"Ошибка при обработке запроса /askmodel: {e}", exc_info=True)
             await self.update_status(processing_msg, f"❌ Произошла ошибка: {str(e)}")
@@ -1675,15 +1629,11 @@ class TelegramWhisperBot:
                 # Если это текстовый ответ
                 elif 'description' in result:
                     description = result['description']
-                    
-                    # Разбиваем на части если слишком длинно
-                    message_parts = self.split_message(f"🔀 **Результат обработки {len(images_list)} изображений**\n\n{description}")
-                    
-                    for i, part in enumerate(message_parts):
-                        if i == 0:
-                            await update.message.reply_text(part)
-                        else:
-                            await update.message.reply_text(f"**Продолжение ({i+1}/{len(message_parts)}):**\n\n{part}")
+                    await self.send_ai_response(
+                        update.message, description,
+                        header=f"🔀 <b>Результат обработки {len(images_list)} изображений:</b>",
+                        continuation_header="Продолжение"
+                    )
             
             # Отслеживаем стоимость
             if generation_id:
@@ -2631,6 +2581,32 @@ class TelegramWhisperBot:
             except Exception as e2:
                 logger.error(f"Ошибка при отправке сообщения: {e2}")
                 raise
+    
+    async def send_ai_response(self, message, ai_text: str, header: str, continuation_header: str = "Продолжение"):
+        """Универсальный метод отправки ответа от LLM с корректным Telegram HTML.
+        
+        Конвертирует Markdown → HTML, разбивает на части, отправляет с fallback.
+        
+        Args:
+            message: Telegram message объект для reply_text
+            ai_text: Сырой текст от LLM (может содержать Markdown)
+            header: HTML-заголовок первого сообщения, например '📝 <b>Краткое содержание:</b>'
+            continuation_header: Текст заголовка для продолжений
+        """
+        html_text = self.markdown_to_telegram_html(ai_text)
+        full_message = f"{header}\n\n{html_text}"
+        parts = self.split_message(full_message)
+        
+        logger.info(f"Длина ответа: {len(ai_text)} символов, частей: {len(parts)}")
+        
+        for i, part in enumerate(parts):
+            text_to_send = part if i == 0 else f"📝 <b>{continuation_header} ({i+1}/{len(parts)}):</b>\n\n{part}"
+            try:
+                await message.reply_text(text_to_send, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"Ошибка HTML parse_mode (часть {i+1}): {e}, отправляю без форматирования")
+                plain = part if i == 0 else f"{continuation_header} ({i+1}/{len(parts)}):\n\n{part}"
+                await message.reply_text(plain)
     
     def is_image_url(self, url: str) -> bool:
         """Проверяет, является ли URL ссылкой на изображение"""
