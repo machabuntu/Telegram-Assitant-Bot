@@ -4145,11 +4145,28 @@ class TelegramWhisperBot:
             )
             conn.commit()
             conn.close()
+            _start_day_name_ru = {
+                "sunday": "воскресенье", "вс": "воскресенье", "воскресенье": "воскресенье",
+                "monday": "понедельник", "пн": "понедельник", "понедельник": "понедельник",
+                "tuesday": "вторник",    "вт": "вторник",    "вторник": "вторник",
+                "wednesday": "среду",    "ср": "среду",      "среда": "среду",
+                "thursday": "четверг",   "чт": "четверг",    "четверг": "четверг",
+                "friday": "пятницу",     "пт": "пятницу",    "пятница": "пятницу",
+                "saturday": "субботу",   "сб": "субботу",    "суббота": "субботу",
+            }
+            _cron_day_ru_start = ["воскресенье", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу"]
+            _raw_start_day  = self.config.get("tournament_start_day", "sunday")
+            _raw_start_time = self.config.get("tournament_start_time", "13:00")
+            if str(_raw_start_day).isdigit():
+                _start_day_str = _cron_day_ru_start[int(_raw_start_day) % 7]
+            else:
+                _start_day_str = _start_day_name_ru.get(str(_raw_start_day).lower().strip(), str(_raw_start_day))
+
             await update.message.reply_text(
                 f"✅ <b>Регистрация принята!</b>\n\n"
                 f"⚔️ Боец: <b>{fighter_name}</b>\n"
                 f"🗓 Турнир: <b>{tournament_id}</b>\n\n"
-                "Ждите начала турнира в воскресенье в 13:00 KSK!",
+                f"Ждите начала турнира в <b>{_start_day_str} в {_raw_start_time}</b> KSK!",
                 parse_mode='HTML'
             )
             logger.info(f"Пользователь {username} ({user_id}) зарегистрировал бойца '{fighter_name}' на турнир {tournament_id}")
@@ -4937,7 +4954,7 @@ class TelegramWhisperBot:
                 date_str = banned_at[:10] if banned_at else "?"
                 lines.append(f"{i}. <b>{name}</b> (турнир {tid}, {date_str})")
 
-            text = "⛔ <b>Банлист бойцов-чемпионов:</b>\n\n" + "\n".join(lines)
+            text = "⛔ <b>Банлист:</b>\n\n" + "\n".join(lines)
             await update.message.reply_text(text, parse_mode='HTML')
 
         except Exception as e:
