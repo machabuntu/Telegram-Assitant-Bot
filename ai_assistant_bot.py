@@ -152,12 +152,102 @@ class TelegramWhisperBot:
                 )
             ''')
             
+            # Турнирные таблицы
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournament_registrations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tournament_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    fighter_name TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    disqualified INTEGER DEFAULT 0,
+                    UNIQUE(tournament_id, user_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournament_bans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fighter_name TEXT NOT NULL,
+                    banned_at TEXT NOT NULL,
+                    tournament_id TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournaments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tournament_id TEXT UNIQUE NOT NULL,
+                    status TEXT DEFAULT 'registration',
+                    bracket_json TEXT,
+                    created_at TEXT,
+                    completed_at TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournament_scores (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    total_points INTEGER DEFAULT 0,
+                    first_places INTEGER DEFAULT 0,
+                    second_places INTEGER DEFAULT 0,
+                    semifinal_places INTEGER DEFAULT 0
+                )
+            ''')
+
+            self._migrate_columns(conn)
             conn.commit()
             conn.close()
             logger.info("База данных статистики успешно инициализирована")
         except Exception as e:
             logger.error(f"Ошибка при инициализации базы данных: {e}")
-    
+
+    def _migrate_columns(self, conn: sqlite3.Connection):
+        """Добавляет недостающие колонки в существующие таблицы (безопасный ALTER TABLE).
+        Вызывается автоматически при каждом старте бота — не трогает уже существующие колонки."""
+        expected = {
+            "user_statistics": [
+                ("total_spent",       "REAL    DEFAULT 0"),
+                ("total_requests",    "INTEGER DEFAULT 0"),
+                ("last_request_date", "TEXT"),
+                ("created_at",        "TEXT"),
+            ],
+            "request_history": [
+                ("generation_id",     "TEXT"),
+                ("tokens_prompt",     "INTEGER"),
+                ("tokens_completion", "INTEGER"),
+            ],
+            "tournament_scores": [
+                ("first_places",     "INTEGER DEFAULT 0"),
+                ("second_places",    "INTEGER DEFAULT 0"),
+                ("semifinal_places", "INTEGER DEFAULT 0"),
+            ],
+            "tournament_registrations": [
+                ("disqualified", "INTEGER DEFAULT 0"),
+            ],
+            "tournaments": [
+                ("bracket_json",  "TEXT"),
+                ("completed_at",  "TEXT"),
+            ],
+        }
+        cursor = conn.cursor()
+        for table, columns in expected.items():
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in cursor.fetchall()}
+                if not existing:
+                    # Таблица ещё не создана — пропускаем, CREATE TABLE IF NOT EXISTS создаст её выше
+                    continue
+                for col_name, col_def in columns:
+                    if col_name not in existing:
+                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+                        logger.info(f"Миграция БД: добавлена колонка {table}.{col_name}")
+            except Exception as e:
+                logger.error(f"Миграция БД: ошибка при обработке таблицы {table}: {e}")
+        conn.commit()
+
     def load_selected_models(self) -> dict:
         """Загружает выбранные модели из файла"""
         try:
@@ -2582,31 +2672,45 @@ class TelegramWhisperBot:
                 logger.error(f"Ошибка при отправке сообщения: {e2}")
                 raise
     
-    async def send_ai_response(self, message, ai_text: str, header: str, continuation_header: str = "Продолжение"):
+    async def send_ai_response(self, target, ai_text: str, header: str, continuation_header: str = "Продолжение",
+                               chat_id: str = None):
         """Универсальный метод отправки ответа от LLM с корректным Telegram HTML.
-        
+
         Конвертирует Markdown → HTML, разбивает на части, отправляет с fallback.
-        
+
         Args:
-            message: Telegram message объект для reply_text
+            target: Telegram message объект (reply_text) или Bot объект (send_message, требует chat_id)
             ai_text: Сырой текст от LLM (может содержать Markdown)
             header: HTML-заголовок первого сообщения, например '📝 <b>Краткое содержание:</b>'
             continuation_header: Текст заголовка для продолжений
+            chat_id: ID чата (обязателен когда target — Bot, а не message)
         """
         html_text = self.markdown_to_telegram_html(ai_text)
         full_message = f"{header}\n\n{html_text}"
         parts = self.split_message(full_message)
-        
+
         logger.info(f"Длина ответа: {len(ai_text)} символов, частей: {len(parts)}")
-        
+
+        # Определяем, является ли target Bot-объектом или message-объектом
+        is_bot = hasattr(target, 'send_message') and not hasattr(target, 'reply_text')
+
         for i, part in enumerate(parts):
             text_to_send = part if i == 0 else f"📝 <b>{continuation_header} ({i+1}/{len(parts)}):</b>\n\n{part}"
             try:
-                await message.reply_text(text_to_send, parse_mode='HTML')
+                if is_bot:
+                    await target.send_message(chat_id=chat_id, text=text_to_send, parse_mode='HTML')
+                else:
+                    await target.reply_text(text_to_send, parse_mode='HTML')
             except Exception as e:
                 logger.warning(f"Ошибка HTML parse_mode (часть {i+1}): {e}, отправляю без форматирования")
                 plain = part if i == 0 else f"{continuation_header} ({i+1}/{len(parts)}):\n\n{part}"
-                await message.reply_text(plain)
+                try:
+                    if is_bot:
+                        await target.send_message(chat_id=chat_id, text=plain)
+                    else:
+                        await target.reply_text(plain)
+                except Exception as e2:
+                    logger.error(f"Ошибка при отправке части {i+1}: {e2}")
     
     def is_image_url(self, url: str) -> bool:
         """Проверяет, является ли URL ссылкой на изображение"""
@@ -3889,7 +3993,915 @@ class TelegramWhisperBot:
             logger.info("Временные файлы очищены")
         except Exception as e:
             logger.error(f"Ошибка при очистке временных файлов: {e}")
-    
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TOURNAMENT SYSTEM
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _get_current_tournament_id(self) -> str:
+        """Возвращает ID текущего/последнего активного турнира (YYYY-MM-DD понедельника)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT tournament_id FROM tournaments WHERE status IN ('registration','active') ORDER BY id DESC LIMIT 1"
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def _get_tournament_status(self, tournament_id: str) -> str:
+        """Возвращает статус турнира или None если турнира нет."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM tournaments WHERE tournament_id = ?", (tournament_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    async def open_tournament_registration(self, context):
+        """Открывает регистрацию на турнир (каждый понедельник в 13:00 KSK)."""
+        try:
+            from datetime import date
+            today = date.today()
+            # Нормализуем до понедельника текущей недели
+            monday = today - __import__('datetime').timedelta(days=today.weekday())
+            tournament_id = monday.strftime('%Y-%m-%d')
+
+            channel_id = self.config.get('tournament_channel_id')
+            if not channel_id:
+                logger.error("tournament_channel_id не задан в config.json")
+                return
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO tournaments (tournament_id, status, created_at) VALUES (?, 'registration', ?)",
+                (tournament_id, datetime.now().isoformat())
+            )
+            conn.commit()
+            conn.close()
+
+            text = (
+                "⚔️ <b>ТУРНИР БОЙЦОВ — РЕГИСТРАЦИЯ ОТКРЫТА!</b>\n\n"
+                f"🗓 Неделя: <b>{tournament_id}</b>\n\n"
+                "Напишите боту в <b>личные сообщения</b>:\n"
+                "<code>/reg Имя вашего бойца</code>\n\n"
+                "👾 Можно выбрать любого реального или выдуманного персонажа!\n"
+                "⛔ Персонажи из банлиста не допускаются.\n\n"
+                "⏰ Регистрация закрывается в <b>воскресенье в 13:00</b> по красноярскому времени."
+            )
+            await context.bot.send_message(chat_id=channel_id, text=text, parse_mode='HTML')
+            logger.info(f"Регистрация турнира {tournament_id} открыта")
+        except Exception as e:
+            logger.error(f"Ошибка при открытии регистрации турнира: {e}", exc_info=True)
+
+    async def reg_command(self, update, context):
+        """Обработчик команды /reg — регистрация на турнир (только в личке)."""
+        # Только в личных сообщениях
+        if update.effective_chat.type != 'private':
+            await update.message.reply_text("⚔️ Регистрация на турнир доступна только в личных сообщениях боту.")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажите имя бойца:\n<code>/reg Имя вашего бойца</code>",
+                parse_mode='HTML'
+            )
+            return
+
+        fighter_name = ' '.join(context.args).strip()
+        if len(fighter_name) < 2:
+            await update.message.reply_text("❌ Имя бойца слишком короткое.")
+            return
+        if len(fighter_name) > 100:
+            await update.message.reply_text("❌ Имя бойца слишком длинное (максимум 100 символов).")
+            return
+
+        tournament_id = self._get_current_tournament_id()
+        if not tournament_id:
+            await update.message.reply_text("⚔️ Регистрация сейчас закрыта. Следите за объявлениями в канале!")
+            return
+
+        status = self._get_tournament_status(tournament_id)
+        if status != 'registration':
+            await update.message.reply_text("⚔️ Регистрация на этот турнир уже закрыта.")
+            return
+
+        user = update.effective_user
+        user_id = user.id
+        username = user.username or user.first_name or str(user_id)
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO tournament_registrations (tournament_id, user_id, username, fighter_name, registered_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tournament_id, user_id, username, fighter_name, datetime.now().isoformat())
+            )
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(
+                f"✅ <b>Регистрация принята!</b>\n\n"
+                f"⚔️ Боец: <b>{fighter_name}</b>\n"
+                f"🗓 Турнир: <b>{tournament_id}</b>\n\n"
+                "Ждите начала турнира в воскресенье в 13:00 KSK!",
+                parse_mode='HTML'
+            )
+            logger.info(f"Пользователь {username} ({user_id}) зарегистрировал бойца '{fighter_name}' на турнир {tournament_id}")
+        except sqlite3.IntegrityError:
+            # Уже зарегистрирован — показываем текущего бойца
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT fighter_name FROM tournament_registrations WHERE tournament_id=? AND user_id=?",
+                (tournament_id, user_id)
+            )
+            existing = cursor.fetchone()
+            conn.close()
+            existing_name = existing[0] if existing else "неизвестно"
+            await update.message.reply_text(
+                f"⚠️ Вы уже зарегистрированы на этот турнир с бойцом <b>{existing_name}</b>.\n"
+                "Изменить выбор нельзя.",
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при регистрации на турнир: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при регистрации. Попробуйте позже.")
+
+    async def validate_participants_with_ai(self, participants: list, bans: list) -> list:
+        """Проверяет участников через ИИ: банлист + реальность персонажей.
+        
+        Args:
+            participants: list of dict {user_id, username, fighter_name}
+            bans: list of str (забаненные имена)
+        
+        Returns:
+            list of int (user_id дисквалифицированных)
+        """
+        try:
+            api_config = self.get_api_config("tournament_api")
+
+            bans_str = ", ".join(bans) if bans else "нет"
+            participants_str = "\n".join(
+                f"  user_id={p['user_id']} (@{p['username']}): {p['fighter_name']}"
+                for p in participants
+            )
+
+            prompt = (
+                "Ты — судья турнира. Выполни две проверки для каждого участника.\n\n"
+                f"БАНЛИСТ (забаненные бойцы, победившие в прошлых турнирах):\n{bans_str}\n\n"
+                f"УЧАСТНИКИ ТУРНИРА:\n{participants_str}\n\n"
+                "ПРОВЕРКА 1: Есть ли среди участников бойцы из банлиста? "
+                "Сравнивай нечётко — один и тот же персонаж может быть написан по-разному.\n"
+                "ПРОВЕРКА 2: Все ли заявленные персонажи — реально существующие или существовавшие люди, "
+                "либо широко известные выдуманные персонажи из книг, игр, фильмов, аниме, мифологии и т.д.? "
+                "Если персонаж абсолютно неизвестен или является полной выдумкой без источника — дисквалифицируй.\n\n"
+                "Укажи user_id всех нарушителей. Если нарушений нет — пустой список.\n"
+                "В КОНЦЕ ответа обязательно добавь строку в точном формате:\n"
+                "##DISQUALIFIED:user_id1,user_id2##\n"
+                "Если нарушений нет: ##DISQUALIFIED:[]##\n\n"
+                "Перед меткой напиши краткое объяснение своих решений на русском языке."
+            )
+
+            result = await self.ask_with_openrouter(prompt, api_config)
+            if not result:
+                logger.warning("ИИ не ответил на запрос валидации — пропускаем проверку")
+                return []
+
+            response_text, _ = result
+            logger.info(f"Ответ ИИ на валидацию: {response_text}")
+
+            match = re.search(r'##DISQUALIFIED:\[([^\]]*)\]##|##DISQUALIFIED:([^#\s]*)##', response_text)
+            if not match:
+                logger.warning("Не удалось найти метку ##DISQUALIFIED## в ответе ИИ")
+                return []
+
+            raw = (match.group(1) or match.group(2) or "").strip()
+            if not raw:
+                return []
+
+            dq_ids = []
+            for part in raw.split(','):
+                part = part.strip()
+                if part.isdigit():
+                    dq_ids.append(int(part))
+            return dq_ids
+
+        except Exception as e:
+            logger.error(f"Ошибка при валидации участников: {e}", exc_info=True)
+            return []
+
+    def build_bracket(self, participants: list) -> dict:
+        """Строит сетку single-elimination из списка участников.
+        
+        Args:
+            participants: list of dict {user_id, username, fighter_name}
+        
+        Returns:
+            dict — структура турнирной сетки
+        """
+        import math
+        import random
+
+        n = len(participants)
+        # Ближайшая степень двойки
+        size = 1
+        while size < n:
+            size *= 2
+
+        # Перемешиваем и дополняем BYE-слотами
+        seeded = list(participants)
+        random.shuffle(seeded)
+        bye_slot = {"user_id": None, "username": None, "fighter_name": "BYE"}
+        while len(seeded) < size:
+            seeded.append(bye_slot)
+
+        num_rounds = int(math.log2(size))
+        rounds = []
+        match_num = 1
+
+        # Первый раунд — из начального списка
+        first_round_matches = []
+        for i in range(0, size, 2):
+            first_round_matches.append({
+                "match_id": f"1-{match_num}",
+                "player1": seeded[i],
+                "player2": seeded[i + 1],
+                "winner_user_id": None,
+                "winner_fighter": None,
+                "story": None,
+                "processed": False
+            })
+            match_num += 1
+
+        rounds.append({"round_number": 1, "matches": first_round_matches})
+
+        # Остальные раунды — пустые слоты TBD
+        tbd = {"user_id": None, "username": None, "fighter_name": "TBD"}
+        for r in range(2, num_rounds + 1):
+            count = size // (2 ** r)
+            matches = []
+            for i in range(count):
+                matches.append({
+                    "match_id": f"{r}-{i+1}",
+                    "player1": dict(tbd),
+                    "player2": dict(tbd),
+                    "winner_user_id": None,
+                    "winner_fighter": None,
+                    "story": None,
+                    "processed": False
+                })
+            rounds.append({"round_number": r, "matches": matches})
+
+        return {
+            "participants": participants,
+            "rounds": rounds,
+            "current_round": 0,
+            "current_match": 0,
+            "champion_user_id": None,
+            "champion_fighter": None
+        }
+
+    def generate_bracket_image(self, bracket: dict) -> 'BytesIO':
+        """Генерирует PNG-картинку турнирной сетки с помощью Pillow."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            rounds = bracket["rounds"]
+            num_rounds = len(rounds)
+            max_slots = len(rounds[0]["matches"]) * 2  # участников в первом раунде
+
+            BOX_W = 240
+            BOX_H = 44
+            H_GAP = 60      # горизонтальный промежуток между раундами
+            V_PAD = 14      # вертикальный отступ внутри матча
+
+            def slot_y(round_idx: int, slot_idx: int) -> int:
+                """Y-координата центра слота (участника) в раунде."""
+                slots_in_round = len(rounds[round_idx]["matches"]) * 2
+                spacing = max_slots / slots_in_round
+                return int((slot_idx + 0.5) * spacing * (BOX_H + V_PAD * 2))
+
+            canvas_h = max_slots * (BOX_H + V_PAD * 2) + 60
+            canvas_w = num_rounds * (BOX_W + H_GAP) + H_GAP + 20
+
+            img = Image.new("RGB", (canvas_w, canvas_h), color=(24, 24, 32))
+            draw = ImageDraw.Draw(img)
+
+            try:
+                font = ImageFont.truetype("arial.ttf", 14)
+                font_bold = ImageFont.truetype("arialbd.ttf", 15)
+                font_small = ImageFont.truetype("arial.ttf", 12)
+            except Exception:
+                font = ImageFont.load_default()
+                font_bold = font
+                font_small = font
+
+            # Цвета
+            C_BOX_DEFAULT = (45, 45, 60)
+            C_BOX_WINNER = (30, 100, 50)
+            C_BOX_LOSER = (60, 30, 30)
+            C_BOX_BYE = (35, 35, 45)
+            C_TEXT = (220, 220, 220)
+            C_TEXT_DIM = (110, 110, 110)
+            C_LINE = (80, 80, 100)
+            C_HEADER = (160, 130, 255)
+
+            round_labels = ["1/8", "1/4", "Полуфинал", "Финал", "Финал", "Финал"]
+
+            for r_idx, rnd in enumerate(rounds):
+                x = H_GAP + r_idx * (BOX_W + H_GAP)
+                label = round_labels[r_idx] if r_idx < len(round_labels) else f"Раунд {r_idx+1}"
+                draw.text((x + BOX_W // 2 - 30, 8), label, fill=C_HEADER, font=font_bold)
+
+                for m_idx, match in enumerate(rnd["matches"]):
+                    slot_indices = [m_idx * 2, m_idx * 2 + 1]
+                    players = [match["player1"], match["player2"]]
+                    winner_uid = match.get("winner_user_id")
+
+                    for p_idx, (player, slot_i) in enumerate(zip(players, slot_indices)):
+                        cy = slot_y(r_idx, slot_i) + 30  # смещение под заголовок
+                        y = cy - BOX_H // 2
+                        fighter = player.get("fighter_name", "TBD") or "TBD"
+                        username = player.get("username")
+                        is_bye = fighter == "BYE"
+                        is_tbd = fighter == "TBD"
+
+                        if is_bye or is_tbd:
+                            box_color = C_BOX_BYE
+                            text_color = C_TEXT_DIM
+                        elif winner_uid is not None and player.get("user_id") == winner_uid:
+                            box_color = C_BOX_WINNER
+                            text_color = C_TEXT
+                        elif winner_uid is not None:
+                            box_color = C_BOX_LOSER
+                            text_color = C_TEXT_DIM
+                        else:
+                            box_color = C_BOX_DEFAULT
+                            text_color = C_TEXT
+
+                        draw.rounded_rectangle(
+                            [x, y, x + BOX_W, y + BOX_H],
+                            radius=6, fill=box_color, outline=(70, 70, 90)
+                        )
+
+                        label_txt = fighter[:28] if len(fighter) <= 28 else fighter[:25] + "..."
+                        draw.text((x + 8, y + 5), label_txt, fill=text_color, font=font_bold)
+                        if username and not is_bye and not is_tbd:
+                            draw.text((x + 8, y + 24), f"@{username}", fill=C_TEXT_DIM, font=font_small)
+
+                    # Соединительные линии к следующему раунду
+                    if r_idx < num_rounds - 1:
+                        cy1 = slot_y(r_idx, slot_indices[0]) + 30
+                        cy2 = slot_y(r_idx, slot_indices[1]) + 30
+                        cx_right = x + BOX_W
+                        cy_mid = (cy1 + cy2) // 2
+                        next_x = cx_right + H_GAP
+
+                        draw.line([(cx_right, cy1), (cx_right + H_GAP // 2, cy1)], fill=C_LINE, width=2)
+                        draw.line([(cx_right, cy2), (cx_right + H_GAP // 2, cy2)], fill=C_LINE, width=2)
+                        draw.line([(cx_right + H_GAP // 2, cy1), (cx_right + H_GAP // 2, cy2)], fill=C_LINE, width=2)
+                        draw.line([(cx_right + H_GAP // 2, cy_mid), (next_x, cy_mid)], fill=C_LINE, width=2)
+
+            buf = BytesIO()
+            img.save(buf, format='PNG')
+            buf.seek(0)
+            return buf
+
+        except Exception as e:
+            logger.error(f"Ошибка при генерации изображения сетки: {e}", exc_info=True)
+            return None
+
+    def _save_bracket(self, tournament_id: str, bracket: dict):
+        """Сохраняет сетку в БД."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE tournaments SET bracket_json=? WHERE tournament_id=?",
+            (json.dumps(bracket, ensure_ascii=False), tournament_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def _load_bracket(self, tournament_id: str) -> dict:
+        """Загружает сетку из БД."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT bracket_json FROM tournaments WHERE tournament_id=?", (tournament_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return json.loads(row[0])
+        return None
+
+    async def close_and_start_tournament(self, context):
+        """Закрывает регистрацию и запускает турнир (каждое воскресенье в 13:00 KSK)."""
+        try:
+            tournament_id = self._get_current_tournament_id()
+            channel_id = self.config.get('tournament_channel_id')
+
+            if not tournament_id or not channel_id:
+                logger.info("Нет активного турнира для закрытия.")
+                return
+
+            if self._get_tournament_status(tournament_id) != 'registration':
+                logger.info(f"Турнир {tournament_id} уже не в фазе регистрации.")
+                return
+
+            # Закрываем регистрацию
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE tournaments SET status='validation' WHERE tournament_id=?",
+                (tournament_id,)
+            )
+            cursor.execute(
+                "SELECT user_id, username, fighter_name FROM tournament_registrations "
+                "WHERE tournament_id=? AND disqualified=0",
+                (tournament_id,)
+            )
+            rows = cursor.fetchall()
+            conn.commit()
+            conn.close()
+
+            participants = [{"user_id": r[0], "username": r[1], "fighter_name": r[2]} for r in rows]
+
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=(
+                    f"⚔️ <b>Регистрация на турнир {tournament_id} закрыта!</b>\n\n"
+                    f"Зарегистрировалось участников: <b>{len(participants)}</b>\n\n"
+                    "🔍 Проверяю участников..."
+                ),
+                parse_mode='HTML'
+            )
+
+            if len(participants) < 2:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text="❌ <b>Турнир отменён</b> — недостаточно участников (нужно минимум 2).",
+                    parse_mode='HTML'
+                )
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE tournaments SET status='cancelled' WHERE tournament_id=?",
+                    (tournament_id,)
+                )
+                conn.commit()
+                conn.close()
+                return
+
+            # Получаем банлист
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT fighter_name FROM tournament_bans")
+            bans = [r[0] for r in cursor.fetchall()]
+            conn.close()
+
+            # Валидация участников через ИИ
+            dq_ids = await self.validate_participants_with_ai(participants, bans)
+
+            if dq_ids:
+                dq_participants = [p for p in participants if p["user_id"] in dq_ids]
+                valid_participants = [p for p in participants if p["user_id"] not in dq_ids]
+
+                # Помечаем дисквалифицированных в БД
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                for uid in dq_ids:
+                    cursor.execute(
+                        "UPDATE tournament_registrations SET disqualified=1 "
+                        "WHERE tournament_id=? AND user_id=?",
+                        (tournament_id, uid)
+                    )
+                conn.commit()
+                conn.close()
+
+                dq_lines = "\n".join(
+                    f"• @{p['username']} → <b>{p['fighter_name']}</b>" for p in dq_participants
+                )
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=(
+                        "🚫 <b>Дисквалифицированы:</b>\n\n"
+                        f"{dq_lines}\n\n"
+                        "(бан или неизвестный персонаж)"
+                    ),
+                    parse_mode='HTML'
+                )
+                participants = valid_participants
+
+            if len(participants) < 2:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text="❌ <b>Турнир отменён</b> — после дисквалификаций осталось меньше 2 участников.",
+                    parse_mode='HTML'
+                )
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE tournaments SET status='cancelled' WHERE tournament_id=?",
+                    (tournament_id,)
+                )
+                conn.commit()
+                conn.close()
+                return
+
+            # Строим сетку
+            bracket = self.build_bracket(participants)
+            self._save_bracket(tournament_id, bracket)
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE tournaments SET status='active' WHERE tournament_id=?",
+                (tournament_id,)
+            )
+            conn.commit()
+            conn.close()
+
+            participants_list = "\n".join(
+                f"• <b>{p['fighter_name']}</b> (@{p['username']})" for p in participants
+            )
+            await context.bot.send_message(
+                chat_id=channel_id,
+                text=(
+                    f"🏆 <b>ТУРНИР {tournament_id} НАЧИНАЕТСЯ!</b>\n\n"
+                    f"Участники ({len(participants)}):\n{participants_list}\n\n"
+                    "⚔️ Генерирую турнирную сетку..."
+                ),
+                parse_mode='HTML'
+            )
+
+            # Отправляем сетку
+            image_buf = self.generate_bracket_image(bracket)
+            if image_buf:
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_buf,
+                    caption=f"🏆 Турнирная сетка — {tournament_id}"
+                )
+
+            # Запускаем первый бой немедленно
+            from datetime import timedelta
+            context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=10))
+
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии/запуске турнира: {e}", exc_info=True)
+
+    async def process_next_match(self, context):
+        """Обрабатывает следующий бой в турнире."""
+        try:
+            tournament_id = self._get_current_tournament_id()
+            channel_id = self.config.get('tournament_channel_id')
+            if not tournament_id or not channel_id:
+                return
+
+            bracket = self._load_bracket(tournament_id)
+            if not bracket:
+                logger.error("Не удалось загрузить сетку турнира")
+                return
+
+            api_config = self.get_api_config("tournament_api")
+            from datetime import timedelta
+
+            # Ищем следующий необработанный матч
+            found = False
+            for r_idx, rnd in enumerate(bracket["rounds"]):
+                for m_idx, match in enumerate(rnd["matches"]):
+                    if match["processed"]:
+                        continue
+
+                    p1 = match["player1"]
+                    p2 = match["player2"]
+
+                    # Пропускаем если слот ещё не заполнен (TBD)
+                    if p1.get("fighter_name") == "TBD" or p2.get("fighter_name") == "TBD":
+                        continue
+
+                    found = True
+                    fighter1 = p1["fighter_name"]
+                    fighter2 = p2["fighter_name"]
+                    round_label = f"Раунд {rnd['round_number']}, матч {m_idx + 1}"
+
+                    # BYE — автопобеда
+                    if p2.get("fighter_name") == "BYE":
+                        winner = p1
+                        story = f"⚡ {fighter1} получает автоматическую победу (BYE)."
+                    elif p1.get("fighter_name") == "BYE":
+                        winner = p2
+                        story = f"⚡ {fighter2} получает автоматическую победу (BYE)."
+                    else:
+                        # Отправляем в канал анонс боя
+                        await context.bot.send_message(
+                            chat_id=channel_id,
+                            text=(
+                                f"⚔️ <b>{round_label}</b>\n\n"
+                                f"🥊 <b>{fighter1}</b> (@{p1.get('username','?')})\n"
+                                f"   VS\n"
+                                f"🥊 <b>{fighter2}</b> (@{p2.get('username','?')})"
+                            ),
+                            parse_mode='HTML'
+                        )
+
+                        prompt = (
+                            f"Проведи эпичный бой один на один: {fighter1} против {fighter2}.\n"
+                            "Напиши увлекательный рассказ о битве (4-6 предложений) на русском языке.\n"
+                            "Учитывай реальные способности и силы персонажей.\n\n"
+                            "ВАЖНО: в самом конце добавь строку точно в таком формате (без изменений):\n"
+                            f"##WINNER:{fighter1}## или ##WINNER:{fighter2}##"
+                        )
+
+                        result = await self.ask_with_openrouter(prompt, api_config)
+                        winner = None
+                        story = None
+
+                        if result:
+                            response_text, _ = result
+                            # Извлекаем победителя
+                            winner_match = re.search(r'##WINNER:(.+?)##', response_text)
+                            # Убираем техническую метку из текста
+                            story = re.sub(r'##WINNER:.+?##', '', response_text).strip()
+
+                            if winner_match:
+                                winner_name = winner_match.group(1).strip()
+                                # Определяем кто победил по близости имени
+                                f1_low = fighter1.lower()
+                                f2_low = fighter2.lower()
+                                w_low = winner_name.lower()
+                                if f1_low in w_low or w_low in f1_low:
+                                    winner = p1
+                                elif f2_low in w_low or w_low in f2_low:
+                                    winner = p2
+                                else:
+                                    # Fallback — p1 побеждает
+                                    winner = p1
+                                    story = (story or "") + f"\n\n_(ИИ не смог однозначно определить победителя, засчитана победа {fighter1})_"
+                            else:
+                                # Повторная попытка не удалась — p1 побеждает
+                                winner = p1
+                                story = (story or f"Битва {fighter1} vs {fighter2} завершилась.") + f"\n\n_(Победа присуждена {fighter1} по умолчанию)_"
+                        else:
+                            winner = p1
+                            story = f"Битва {fighter1} vs {fighter2}. ИИ не ответил — победа присуждена {fighter1}."
+
+                        # Отправляем историю боя в канал
+                        await self.send_ai_response(
+                            context.bot,
+                            story,
+                            header=f"📖 <b>{round_label}: {fighter1} vs {fighter2}</b>",
+                            continuation_header="Продолжение",
+                            chat_id=channel_id
+                        )
+
+                    # Обновляем матч
+                    match["winner_user_id"] = winner.get("user_id")
+                    match["winner_fighter"] = winner.get("fighter_name")
+                    match["story"] = story
+                    match["processed"] = True
+
+                    # Продвигаем победителя в следующий раунд
+                    next_r_idx = r_idx + 1
+                    if next_r_idx < len(bracket["rounds"]):
+                        next_match_idx = m_idx // 2
+                        next_match = bracket["rounds"][next_r_idx]["matches"][next_match_idx]
+                        if m_idx % 2 == 0:
+                            next_match["player1"] = winner
+                        else:
+                            next_match["player2"] = winner
+
+                    self._save_bracket(tournament_id, bracket)
+
+                    # Отправляем обновлённую сетку
+                    image_buf = self.generate_bracket_image(bracket)
+                    if image_buf:
+                        await context.bot.send_photo(
+                            chat_id=channel_id,
+                            photo=image_buf,
+                            caption=f"🏆 Обновлённая сетка ({round_label})"
+                        )
+
+                    break  # Обрабатываем по одному матчу
+                if found:
+                    break
+
+            if found:
+                # Проверяем, есть ли ещё необработанные матчи
+                has_more = any(
+                    not m["processed"] and m["player1"].get("fighter_name") != "TBD"
+                    and m["player2"].get("fighter_name") != "TBD"
+                    for rnd in bracket["rounds"]
+                    for m in rnd["matches"]
+                )
+                # Также смотрим на матчи где один из TBD — их скоро заполнят
+                has_remaining = any(
+                    not m["processed"]
+                    for rnd in bracket["rounds"]
+                    for m in rnd["matches"]
+                )
+
+                if has_remaining:
+                    context.job_queue.run_once(self.process_next_match, when=timedelta(minutes=30))
+                else:
+                    await self.announce_tournament_winner(context, bracket, tournament_id)
+            else:
+                # Все матчи обработаны
+                await self.announce_tournament_winner(context, bracket, tournament_id)
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке матча турнира: {e}", exc_info=True)
+
+    async def announce_tournament_winner(self, context, bracket: dict, tournament_id: str):
+        """Объявляет победителя турнира и обновляет очки/банлист."""
+        try:
+            channel_id = self.config.get('tournament_channel_id')
+
+            # Находим чемпиона — победитель последнего матча
+            last_round = bracket["rounds"][-1]
+            champion = None
+            finalist = None
+
+            if last_round["matches"]:
+                final_match = last_round["matches"][0]
+                winner_uid = final_match.get("winner_user_id")
+                winner_fighter = final_match.get("winner_fighter")
+
+                p1 = final_match["player1"]
+                p2 = final_match["player2"]
+
+                if winner_uid == p1.get("user_id"):
+                    champion = p1
+                    finalist = p2
+                else:
+                    champion = p2
+                    finalist = p1
+
+            if not champion:
+                # Если финал не сыгран, берём из participants кто остался
+                logger.warning("Не удалось определить чемпиона из финального матча")
+                return
+
+            # Находим полуфиналистов (проигравшие в предпоследнем раунде)
+            semifinalists = []
+            if len(bracket["rounds"]) >= 2:
+                semi_round = bracket["rounds"][-2]
+                for match in semi_round["matches"]:
+                    w_uid = match.get("winner_user_id")
+                    for player in [match["player1"], match["player2"]]:
+                        if player.get("user_id") and player.get("user_id") != w_uid:
+                            semifinalists.append(player)
+
+            # Обновляем очки в БД
+            def update_score(user_id, username, points, field):
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO tournament_scores (user_id, username, total_points, first_places, second_places, semifinal_places) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET "
+                    "username=excluded.username, total_points=total_points+excluded.total_points, "
+                    f"{field}={field}+1",
+                    (user_id, username, points,
+                     1 if field == "first_places" else 0,
+                     1 if field == "second_places" else 0,
+                     1 if field == "semifinal_places" else 0)
+                )
+                conn.commit()
+                conn.close()
+
+            if champion.get("user_id"):
+                update_score(champion["user_id"], champion.get("username", ""), 5, "first_places")
+            if finalist and finalist.get("user_id"):
+                update_score(finalist["user_id"], finalist.get("username", ""), 3, "second_places")
+            for sf in semifinalists:
+                if sf.get("user_id"):
+                    update_score(sf["user_id"], sf.get("username", ""), 1, "semifinal_places")
+
+            # Добавляем чемпиона в банлист
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO tournament_bans (fighter_name, banned_at, tournament_id) VALUES (?, ?, ?)",
+                (champion.get("fighter_name", ""), datetime.now().isoformat(), tournament_id)
+            )
+            cursor.execute(
+                "UPDATE tournaments SET status='completed', completed_at=? WHERE tournament_id=?",
+                (datetime.now().isoformat(), tournament_id)
+            )
+            conn.commit()
+            conn.close()
+
+            bracket["champion_user_id"] = champion.get("user_id")
+            bracket["champion_fighter"] = champion.get("fighter_name")
+            self._save_bracket(tournament_id, bracket)
+
+            # Финальная картинка сетки
+            image_buf = self.generate_bracket_image(bracket)
+
+            semi_text = ""
+            if semifinalists:
+                semi_lines = "\n".join(
+                    f"🥉 <b>{s.get('fighter_name')}</b> (@{s.get('username','?')}) — 1 очко"
+                    for s in semifinalists
+                )
+                semi_text = f"\n\n{semi_lines}"
+
+            announcement = (
+                f"🏆 <b>ТУРНИР {tournament_id} ЗАВЕРШЁН!</b>\n\n"
+                f"🥇 <b>ЧЕМПИОН: {champion.get('fighter_name')}</b>\n"
+                f"   (@{champion.get('username','?')}) — 5 очков\n\n"
+                f"🥈 Финалист: <b>{finalist.get('fighter_name') if finalist else '—'}</b>"
+                f" (@{finalist.get('username','?') if finalist else '?'}) — 3 очка"
+                f"{semi_text}\n\n"
+                f"⛔ <b>{champion.get('fighter_name')}</b> занесён в банлист!\n\n"
+                "Используйте /leaderboard чтобы посмотреть таблицу лидеров."
+            )
+
+            if image_buf:
+                await context.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=image_buf,
+                    caption=announcement,
+                    parse_mode='HTML'
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=announcement,
+                    parse_mode='HTML'
+                )
+
+            logger.info(f"Турнир {tournament_id} завершён. Чемпион: {champion.get('fighter_name')}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при объявлении победителя турнира: {e}", exc_info=True)
+
+    async def banlist_command(self, update, context):
+        """Показывает список забаненных бойцов."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT fighter_name, tournament_id, banned_at FROM tournament_bans ORDER BY banned_at DESC"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                await update.message.reply_text(
+                    "⛔ <b>Банлист пуст</b> — турниры ещё не проводились или победители не определены.",
+                    parse_mode='HTML'
+                )
+                return
+
+            lines = []
+            for i, (name, tid, banned_at) in enumerate(rows, 1):
+                date_str = banned_at[:10] if banned_at else "?"
+                lines.append(f"{i}. <b>{name}</b> (турнир {tid}, {date_str})")
+
+            text = "⛔ <b>Банлист бойцов-чемпионов:</b>\n\n" + "\n".join(lines)
+            await update.message.reply_text(text, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Ошибка при показе банлиста: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при получении банлиста.")
+
+    async def leaderboard_command(self, update, context):
+        """Показывает таблицу лидеров по турнирным очкам."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, username, total_points, first_places, second_places, semifinal_places "
+                "FROM tournament_scores ORDER BY total_points DESC, first_places DESC LIMIT 30"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                await update.message.reply_text(
+                    "🏆 <b>Таблица лидеров пуста</b> — турниры ещё не завершались.",
+                    parse_mode='HTML'
+                )
+                return
+
+            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+            lines = []
+            for i, (uid, username, pts, first, second, semi) in enumerate(rows, 1):
+                medal = medals.get(i, f"{i}.")
+                name = f"@{username}" if username else f"id{uid}"
+                details = f"({first}🥇 {second}🥈 {semi}🥉)"
+                lines.append(f"{medal} <b>{name}</b> — {pts} очков {details}")
+
+            text = "🏆 <b>Таблица лидеров турниров:</b>\n\n" + "\n".join(lines)
+            await update.message.reply_text(text, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Ошибка при показе таблицы лидеров: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при получении таблицы лидеров.")
+
     def setup_handlers(self):
         """Настраивает обработчики команд"""
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -3906,6 +4918,10 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("balance", self.balance_command))
         self.application.add_handler(CommandHandler("statistics", self.statistics_command))
         self.application.add_handler(CommandHandler("reload", self.reload_command))
+        # Турнирные команды
+        self.application.add_handler(CommandHandler("reg", self.reg_command))
+        self.application.add_handler(CommandHandler("banlist", self.banlist_command))
+        self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
         # Добавляем обработчик для callback кнопок (выбор модели и навигация)
         # Без pattern, чтобы не пропускать неожиданные callback_data и упростить отладку
         self.application.add_handler(CallbackQueryHandler(self.model_callback))
@@ -3991,6 +5007,67 @@ class TelegramWhisperBot:
                     first=6 * 60 * 60  # Первый запуск через 6 часов (уже загрузили при старте)
                 )
                 logger.info("Периодическое обновление моделей настроено (каждые 6 часов)")
+
+                # Турнирные расписания (Красноярское время UTC+7)
+                import pytz
+                from datetime import time as dtime
+                ksk = pytz.timezone('Asia/Krasnoyarsk')
+
+                _day_names = {
+                    "monday": 0, "monday": 0, "пн": 0, "понедельник": 0,
+                    "tuesday": 1, "вт": 1, "вторник": 1,
+                    "wednesday": 2, "ср": 2, "среда": 2,
+                    "thursday": 3, "чт": 3, "четверг": 3,
+                    "friday": 4, "пт": 4, "пятница": 4,
+                    "saturday": 5, "сб": 5, "суббота": 5,
+                    "sunday": 6, "вс": 6, "воскресенье": 6,
+                }
+
+                def _parse_tournament_time(s, default="13:00"):
+                    try:
+                        h, m = map(int, (s or default).split(":"))
+                    except (ValueError, AttributeError):
+                        logger.warning(f"Неверный формат времени турнира '{s}', использую {default}")
+                        h, m = map(int, default.split(":"))
+                    return dtime(h, m, 0, tzinfo=ksk)
+
+                def _parse_tournament_day(s, default_int):
+                    if s is None:
+                        return default_int
+                    # numeric string like "0".."6"
+                    if str(s).isdigit():
+                        v = int(s)
+                        if 0 <= v <= 6:
+                            return v
+                    # named day
+                    v = _day_names.get(str(s).lower().strip())
+                    if v is not None:
+                        return v
+                    logger.warning(f"Неверный день недели '{s}', использую значение по умолчанию {default_int}")
+                    return default_int
+
+                reg_time  = _parse_tournament_time(self.config.get("tournament_registration_time"))
+                reg_day   = _parse_tournament_day(self.config.get("tournament_registration_day"), 0)
+                start_time = _parse_tournament_time(self.config.get("tournament_start_time"))
+                start_day  = _parse_tournament_day(self.config.get("tournament_start_day"), 6)
+
+                _weekday_labels = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+                job_queue.run_daily(
+                    self.open_tournament_registration,
+                    time=reg_time,
+                    days=(reg_day,)
+                )
+                job_queue.run_daily(
+                    self.close_and_start_tournament,
+                    time=start_time,
+                    days=(start_day,)
+                )
+                logger.info(
+                    f"Турнирное расписание настроено: регистрация {_weekday_labels[reg_day]} в "
+                    f"{reg_time.strftime('%H:%M')} KSK, "
+                    f"старт {_weekday_labels[start_day]} в {start_time.strftime('%H:%M')} KSK"
+                )
             else:
                 logger.warning("JobQueue не доступен. Для периодического обновления моделей установите: pip install 'python-telegram-bot[job-queue]'")
             
