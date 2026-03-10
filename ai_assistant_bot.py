@@ -5011,15 +5011,18 @@ class TelegramWhisperBot:
                 from datetime import time as dtime
                 ksk = pytz.timezone('Asia/Krasnoyarsk')
 
+                # PTB v20+ run_daily uses CRON weekday numbering: 0=Sun, 1=Mon, …, 6=Sat
                 _day_names = {
-                    "monday": 0, "monday": 0, "пн": 0, "понедельник": 0,
-                    "tuesday": 1, "вт": 1, "вторник": 1,
-                    "wednesday": 2, "ср": 2, "среда": 2,
-                    "thursday": 3, "чт": 3, "четверг": 3,
-                    "friday": 4, "пт": 4, "пятница": 4,
-                    "saturday": 5, "сб": 5, "суббота": 5,
-                    "sunday": 6, "вс": 6, "воскресенье": 6,
+                    "sunday": 0,    "вс": 0, "воскресенье": 0,
+                    "monday": 1,    "пн": 1, "понедельник": 1,
+                    "tuesday": 2,   "вт": 2, "вторник": 2,
+                    "wednesday": 3, "ср": 3, "среда": 3,
+                    "thursday": 4,  "чт": 4, "четверг": 4,
+                    "friday": 5,    "пт": 5, "пятница": 5,
+                    "saturday": 6,  "сб": 6, "суббота": 6,
                 }
+                # Labels indexed by cron day number (0=Sun … 6=Sat)
+                _weekday_labels = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"]
 
                 def _parse_tournament_time(s, default="13:00"):
                     try:
@@ -5029,27 +5032,25 @@ class TelegramWhisperBot:
                         h, m = map(int, default.split(":"))
                     return dtime(h, m, 0, tzinfo=ksk)
 
-                def _parse_tournament_day(s, default_int):
+                def _parse_tournament_day(s, default_cron):
                     if s is None:
-                        return default_int
-                    # numeric string like "0".."6"
+                        return default_cron
+                    # Numeric string "0".."6" — treat as cron day directly
                     if str(s).isdigit():
                         v = int(s)
                         if 0 <= v <= 6:
                             return v
-                    # named day
+                    # Named day
                     v = _day_names.get(str(s).lower().strip())
                     if v is not None:
                         return v
-                    logger.warning(f"Неверный день недели '{s}', использую значение по умолчанию {default_int}")
-                    return default_int
+                    logger.warning(f"Неверный день недели '{s}', использую значение по умолчанию {default_cron}")
+                    return default_cron
 
-                reg_time  = _parse_tournament_time(self.config.get("tournament_registration_time"))
-                reg_day   = _parse_tournament_day(self.config.get("tournament_registration_day"), 0)
+                reg_time   = _parse_tournament_time(self.config.get("tournament_registration_time"))
+                reg_day    = _parse_tournament_day(self.config.get("tournament_registration_day"), 1)   # Mon=1
                 start_time = _parse_tournament_time(self.config.get("tournament_start_time"))
-                start_day  = _parse_tournament_day(self.config.get("tournament_start_day"), 6)
-
-                _weekday_labels = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+                start_day  = _parse_tournament_day(self.config.get("tournament_start_day"), 0)          # Sun=0
 
                 job_queue.run_daily(
                     self.open_tournament_registration,
