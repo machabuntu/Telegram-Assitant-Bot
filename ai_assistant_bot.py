@@ -4041,6 +4041,24 @@ class TelegramWhisperBot:
             conn.commit()
             conn.close()
 
+            # Читаем время и день окончания регистрации из конфига
+            _day_name_ru = {
+                "sunday": "воскресенье", "вс": "воскресенье", "воскресенье": "воскресенье",
+                "monday": "понедельник", "пн": "понедельник", "понедельник": "понедельник",
+                "tuesday": "вторник",    "вт": "вторник",    "вторник": "вторник",
+                "wednesday": "среду",    "ср": "среду",      "среда": "среду",
+                "thursday": "четверг",   "чт": "четверг",    "четверг": "четверг",
+                "friday": "пятницу",     "пт": "пятницу",    "пятница": "пятницу",
+                "saturday": "субботу",   "сб": "субботу",    "суббота": "субботу",
+            }
+            _cron_day_ru = ["воскресенье", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу"]
+            raw_day  = self.config.get("tournament_start_day", "sunday")
+            raw_time = self.config.get("tournament_start_time", "13:00")
+            if str(raw_day).isdigit():
+                close_day_str = _cron_day_ru[int(raw_day) % 7]
+            else:
+                close_day_str = _day_name_ru.get(str(raw_day).lower().strip(), str(raw_day))
+
             text = (
                 "⚔️ <b>ТУРНИР БОЙЦОВ — РЕГИСТРАЦИЯ ОТКРЫТА!</b>\n\n"
                 f"🗓 Неделя: <b>{tournament_id}</b>\n\n"
@@ -4048,7 +4066,7 @@ class TelegramWhisperBot:
                 "<code>/reg Имя вашего бойца</code>\n\n"
                 "👾 Можно выбрать любого реального или выдуманного персонажа!\n"
                 "⛔ Персонажи из банлиста не допускаются.\n\n"
-                "⏰ Регистрация закрывается в <b>воскресенье в 13:00</b> по красноярскому времени."
+                f"⏰ Регистрация закрывается в <b>{close_day_str} в {raw_time}</b> по красноярскому времени."
             )
             await context.bot.send_message(chat_id=channel_id, text=text, parse_mode='HTML')
             logger.info(f"Регистрация турнира {tournament_id} открыта")
