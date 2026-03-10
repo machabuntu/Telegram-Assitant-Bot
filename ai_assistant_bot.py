@@ -4289,14 +4289,48 @@ class TelegramWhisperBot:
             img = Image.new("RGB", (canvas_w, canvas_h), color=(24, 24, 32))
             draw = ImageDraw.Draw(img)
 
-            try:
-                font = ImageFont.truetype("arial.ttf", 14)
-                font_bold = ImageFont.truetype("arialbd.ttf", 15)
-                font_small = ImageFont.truetype("arial.ttf", 12)
-            except Exception:
-                font = ImageFont.load_default()
-                font_bold = font
-                font_small = font
+            # Font candidates — ordered by preference, all support Cyrillic.
+            # Covers Linux (DejaVu/Liberation/Ubuntu/FreeSans) and Windows (Arial).
+            _FONT_CANDIDATES = [
+                # DejaVu — ships with most Linux distros
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                # Liberation (RHEL/CentOS/Fedora)
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                # Ubuntu fonts
+                "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+                "/usr/share/fonts/truetype/ubuntu-font-family/Ubuntu-R.ttf",
+                # FreeSans (older Debian/Ubuntu)
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+                # Windows fallback
+                "arial.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+            ]
+            _FONT_BOLD_CANDIDATES = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+                "/usr/share/fonts/truetype/ubuntu-font-family/Ubuntu-B.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+                "arialbd.ttf",
+                "C:/Windows/Fonts/arialbd.ttf",
+            ]
+
+            def _load_font(candidates, size):
+                for path in candidates:
+                    try:
+                        return ImageFont.truetype(path, size)
+                    except Exception:
+                        continue
+                # Last resort: Pillow's built-in default (no Cyrillic but never crashes)
+                return ImageFont.load_default()
+
+            font       = _load_font(_FONT_CANDIDATES,      14)
+            font_bold  = _load_font(_FONT_BOLD_CANDIDATES, 15)
+            font_small = _load_font(_FONT_CANDIDATES,      12)
 
             # Цвета
             C_BOX_DEFAULT = (45, 45, 60)
