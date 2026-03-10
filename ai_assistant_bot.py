@@ -4034,10 +4034,36 @@ class TelegramWhisperBot:
 
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR IGNORE INTO tournaments (tournament_id, status, created_at) VALUES (?, 'registration', ?)",
-                (tournament_id, datetime.now().isoformat())
-            )
+
+            # Check existing tournament state:
+            # - No row         → create new 'registration' row
+            # - 'completed'    → reset to 'registration' (covers debug re-runs and same-week restarts)
+            # - 'registration' → already open, re-send announcement but don't touch DB
+            # - 'active'       → tournament in progress, skip silently
+            cursor.execute("SELECT status FROM tournaments WHERE tournament_id = ?", (tournament_id,))
+            existing = cursor.fetchone()
+            existing_status = existing[0] if existing else None
+
+            if existing_status == 'active':
+                logger.warning(f"Турнир {tournament_id} уже активен — пропускаю открытие регистрации")
+                conn.close()
+                return
+            elif existing_status == 'completed':
+                # Reset so participants can register again (debug re-run or rare re-use of a week slot)
+                cursor.execute(
+                    "UPDATE tournaments SET status='registration', bracket_json=NULL, completed_at=NULL, created_at=? WHERE tournament_id=?",
+                    (datetime.now().isoformat(), tournament_id)
+                )
+                # Clear stale registrations from the previous run
+                cursor.execute("DELETE FROM tournament_registrations WHERE tournament_id=?", (tournament_id,))
+                logger.info(f"Турнир {tournament_id} сброшен в 'registration' (повторный запуск)")
+            elif existing_status is None:
+                cursor.execute(
+                    "INSERT INTO tournaments (tournament_id, status, created_at) VALUES (?, 'registration', ?)",
+                    (tournament_id, datetime.now().isoformat())
+                )
+            # else: existing_status == 'registration' — already open, just re-send the announcement
+
             conn.commit()
             conn.close()
 
