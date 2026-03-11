@@ -4091,7 +4091,7 @@ class TelegramWhisperBot:
                 "Напишите боту в <b>личные сообщения</b>:\n"
                 "<code>/reg Имя вашего бойца</code>\n\n"
                 "👾 Можно выбрать любого реального или выдуманного персонажа!\n"
-                "⛔ Персонажи из банлиста не допускаются.\n\n"
+                "⛔ Персонажи из банлиста не допускаются. <code>/banlist</code>\n\n"
                 f"⏰ Регистрация закрывается в <b>{close_day_str} в {raw_time}</b> по красноярскому времени."
             )
             await context.bot.send_message(chat_id=channel_id, text=text, parse_mode='HTML')
