@@ -55,7 +55,9 @@ class TelegramWhisperBot:
         self.selected_models_file = "selected_models.json"
         # Хранилище выбранных моделей {chat_id: model_id}
         self.selected_models = self.load_selected_models()
-        
+        # Спам-защита для /reg: {user_id: {"count": int, "banned_until": datetime | None}}
+        self._reg_spam: dict = {}
+
     def load_config(self, config_file: str) -> dict:
         """Загружает конфигурацию из JSON файла"""
         try:
@@ -4121,6 +4123,25 @@ class TelegramWhisperBot:
             await update.message.reply_text("❌ Имя бойца слишком длинное (максимум 100 символов).")
             return
 
+        user = update.effective_user
+        user_id = user.id
+        username = user.username or user.first_name or str(user_id)
+
+        # ── Спам-защита: проверяем бан до любых запросов к БД/ИИ ──────────────
+        spam_state = self._reg_spam.get(user_id)
+        if spam_state and spam_state.get("banned_until"):
+            if datetime.now() < spam_state["banned_until"]:
+                ban_until_str = spam_state["banned_until"].strftime("%H:%M")
+                await update.message.reply_text(
+                    f"🚫 Вы заблокированы за повторные попытки зарегистрировать занятого персонажа.\n"
+                    f"Бан снимется в <b>{ban_until_str}</b>.",
+                    parse_mode='HTML'
+                )
+                return
+            else:
+                # Бан истёк — сбрасываем
+                self._reg_spam[user_id] = {"count": 0, "banned_until": None}
+
         tournament_id = self._get_current_tournament_id()
         if not tournament_id:
             await update.message.reply_text("⚔️ Регистрация сейчас закрыта. Следите за объявлениями в канале!")
@@ -4131,9 +4152,40 @@ class TelegramWhisperBot:
             await update.message.reply_text("⚔️ Регистрация на этот турнир уже закрыта.")
             return
 
-        user = update.effective_user
-        user_id = user.id
-        username = user.username or user.first_name or str(user_id)
+        # ── Проверка дубля через ИИ ────────────────────────────────────────────
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT fighter_name FROM tournament_registrations WHERE tournament_id=? AND disqualified=0",
+            (tournament_id,)
+        )
+        existing_fighters = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        if existing_fighters:
+            is_taken = await self._check_fighter_duplicate(fighter_name, existing_fighters)
+            if is_taken:
+                state = self._reg_spam.setdefault(user_id, {"count": 0, "banned_until": None})
+                state["count"] += 1
+                if state["count"] >= 3:
+                    from datetime import timedelta
+                    state["banned_until"] = datetime.now() + timedelta(hours=1)
+                    ban_until_str = state["banned_until"].strftime("%H:%M")
+                    await update.message.reply_text(
+                        f"🚫 Персонаж <b>{fighter_name}</b> уже зарегистрирован другим участником.\n\n"
+                        f"Слишком много попыток зарегистрировать занятого персонажа. "
+                        f"Вы заблокированы на 1 час (до <b>{ban_until_str}</b>).",
+                        parse_mode='HTML'
+                    )
+                else:
+                    attempts_left = 3 - state["count"]
+                    await update.message.reply_text(
+                        f"⚠️ Персонаж <b>{fighter_name}</b> уже зарегистрирован другим участником.\n"
+                        f"Выберите другого бойца.\n\n"
+                        f"<i>Осталось попыток до бана: {attempts_left}</i>",
+                        parse_mode='HTML'
+                    )
+                return
 
         try:
             conn = sqlite3.connect(self.db_path)
@@ -4145,6 +4197,8 @@ class TelegramWhisperBot:
             )
             conn.commit()
             conn.close()
+            # Успешная регистрация — сбрасываем счётчик спама
+            self._reg_spam[user_id] = {"count": 0, "banned_until": None}
             _start_day_name_ru = {
                 "sunday": "воскресенье", "вс": "воскресенье", "воскресенье": "воскресенье",
                 "monday": "понедельник", "пн": "понедельник", "понедельник": "понедельник",
@@ -4189,6 +4243,51 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка при регистрации на турнир: {e}", exc_info=True)
             await update.message.reply_text("❌ Ошибка при регистрации. Попробуйте позже.")
+
+    async def _check_fighter_duplicate(self, new_fighter: str, existing_fighters: list) -> bool:
+        """Проверяет через ИИ, не занят ли персонаж (нечёткое совпадение).
+        Возвращает True если занято, False если свободно.
+        При ошибке API возвращает False, чтобы не блокировать регистрацию."""
+        try:
+            api_config = self.get_api_config("reg_check_api")
+            fighters_list = "\n".join(f"- {f}" for f in existing_fighters)
+            prompt = (
+                "Тебе дан список уже зарегистрированных персонажей/личностей и имя нового участника.\n"
+                "Определи, является ли новый участник тем же персонажем, что и кто-то из списка "
+                "(учитывай разные языки, написания, сокращения, возможные опечатки).\n"
+                "Ответь СТРОГО одним словом: ЗАНЯТО — если такой персонаж уже есть в списке, "
+                "НЕ ЗАНЯТО — если не найден.\n\n"
+                f"Зарегистрированные:\n{fighters_list}\n\n"
+                f"Новая заявка: {new_fighter}"
+            )
+
+            provider = api_config.get("provider", "openrouter")
+            provider_cfg = api_config.get(provider, {})
+            url = provider_cfg.get("url", "https://openrouter.ai/api/v1/chat/completions")
+            key = provider_cfg.get("key", "")
+            model = provider_cfg.get("model", "mistralai/mistral-small-2503")
+
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            data = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0,
+            }
+
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            if response.status_code != 200:
+                logger.warning(f"_check_fighter_duplicate: API вернул {response.status_code}, пропускаем проверку")
+                return False
+            result = response.json()
+
+            answer = result["choices"][0]["message"]["content"].strip().upper()
+            logger.info(f"_check_fighter_duplicate: '{new_fighter}' vs {existing_fighters} → {answer}")
+            return "ЗАНЯТО" in answer
+
+        except Exception as e:
+            logger.warning(f"_check_fighter_duplicate: ошибка ({e}), пропускаем проверку дубля")
+            return False
 
     async def validate_participants_with_ai(self, participants: list, bans: list) -> list:
         """Проверяет участников через ИИ: банлист + реальность персонажей.
