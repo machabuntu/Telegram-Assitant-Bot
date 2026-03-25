@@ -27,6 +27,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class _RedactDataImageLogFilter(logging.Filter):
+    """Убирает из любых лог-сообщений data:image/...;base64,... чтобы файлы не раздувались."""
+
+    _pat = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=\r\n]+", re.DOTALL)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "data:image" not in msg or ";base64," not in msg:
+            return True
+        new_msg = self._pat.sub(lambda m: f"<omitted base64 {len(m.group(0))} chars>", msg)
+        if new_msg != msg:
+            record.msg = new_msg
+            record.args = ()
+        return True
+
+
+# Фильтр на корневой логгер — срабатывает для всех дочерних логгеров
+logging.getLogger().addFilter(_RedactDataImageLogFilter())
+
 # Отключаем логи HTTP запросов
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
@@ -367,7 +390,7 @@ class TelegramWhisperBot:
             
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"Метаданные генерации {generation_id}: {result}")
+                logger.info(f"Метаданные генерации {generation_id}: {self._format_api_result_for_log(result)}")
                 
                 data = result.get("data", {})
                 total_cost = data.get("total_cost", 0)
@@ -481,7 +504,59 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка при извлечении generation_id: {e}")
             return None
-    
+
+    def _sanitize_for_log(self, obj, depth: int = 0):
+        """Убирает из структуры data:image...;base64,... и гигантские base64-строки для безопасного логирования."""
+        if depth > 24:
+            return "<max depth>"
+        if obj is None or isinstance(obj, (bool, int, float)):
+            return obj
+        if isinstance(obj, str):
+            if "data:image/" in obj and ";base64," in obj:
+                try:
+                    head, b64rest = obj.split(";base64,", 1)
+                    return f"{head};base64,<omitted {len(b64rest)} chars>"
+                except ValueError:
+                    pass
+            if len(obj) > 4000:
+                st = obj.strip()
+                if len(st) > 4000 and re.match(r"^[A-Za-z0-9+/=\s]+$", st[:2000]):
+                    return f"<long base64-like string omitted: {len(obj)} chars>"
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): self._sanitize_for_log(v, depth + 1) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._sanitize_for_log(v, depth + 1) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._sanitize_for_log(v, depth + 1) for v in obj)
+        return f"<{type(obj).__name__}>"
+
+    def _format_api_result_for_log(self, obj) -> str:
+        """JSON-снимок ответа API без раздувания лога base64."""
+        try:
+            s = json.dumps(self._sanitize_for_log(obj), ensure_ascii=False, default=str)
+        except Exception:
+            s = str(self._sanitize_for_log(obj))
+        max_total = 12000
+        if len(s) > max_total:
+            return s[:max_total] + f"...<log truncated, was {len(s)} chars>"
+        return s
+
+    def _truncate_http_error_body(self, text: str, max_len: int = 2000) -> str:
+        """Тело ошибки HTTP без data-URL и без мегабайт текста."""
+        if not text:
+            return text
+        if "data:image/" in text and ";base64," in text:
+            text = re.sub(
+                r"data:image/[^;]+;base64,[A-Za-z0-9+/=\r\n]+",
+                lambda m: f"<data:image base64 omitted {len(m.group(0))} chars>",
+                text,
+                flags=re.DOTALL,
+            )
+        if len(text) > max_len:
+            return text[:max_len] + f"...<truncated {len(text) - max_len} chars>"
+        return text
+
     def save_generated_image(self, image_bytes: bytes, image_format: str, chat_id: int, command_type: str) -> Path:
         """Сохраняет сгенерированное изображение в папку
         
@@ -3164,7 +3239,7 @@ class TelegramWhisperBot:
             if response.status_code == 200:
                 result = response.json()
                 logger.info(f"Получен ответ от API, обрабатываю...")
-                logger.info(f"Ответ API: {result}")
+                logger.info(f"Ответ API: {self._format_api_result_for_log(result)}")
                 
                 # Извлекаем generation_id для отслеживания стоимости
                 generation_id = self.get_generation_id_from_response(result)
@@ -3275,10 +3350,12 @@ class TelegramWhisperBot:
                                     logger.info("Изображение успешно сгенерировано через OpenRouter (URL в data)")
                                     return {'url': url, 'generation_id': generation_id}
                 
-                logger.error(f"Неожиданный формат ответа от OpenRouter API: {result}")
+                logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
             else:
-                logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
+                logger.error(
+                    f"Ошибка OpenRouter API: {response.status_code} - {self._truncate_http_error_body(response.text)}"
+                )
                 return None
                 
         except Exception as e:
@@ -3356,7 +3433,7 @@ class TelegramWhisperBot:
             if response.status_code == 200:
                 result = response.json()
                 logger.info(f"Получен ответ от API, обрабатываю...")
-                logger.info(f"Ответ API: {result}")
+                logger.info(f"Ответ API: {self._format_api_result_for_log(result)}")
                 
                 # Извлекаем generation_id для отслеживания стоимости
                 generation_id = self.get_generation_id_from_response(result)
@@ -3467,10 +3544,12 @@ class TelegramWhisperBot:
                                     logger.info("Изображение успешно изменено через OpenRouter (URL в data)")
                                     return {'url': url, 'generation_id': generation_id}
                 
-                logger.error(f"Неожиданный формат ответа от OpenRouter API: {result}")
+                logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
             else:
-                logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
+                logger.error(
+                    f"Ошибка OpenRouter API: {response.status_code} - {self._truncate_http_error_body(response.text)}"
+                )
                 return None
                 
         except Exception as e:
@@ -3552,7 +3631,7 @@ class TelegramWhisperBot:
             if response.status_code == 200:
                 result = response.json()
                 logger.info(f"Получен ответ от API, обрабатываю...")
-                logger.info(f"Ответ API (mergeimage): {result}")
+                logger.info(f"Ответ API (mergeimage): {self._format_api_result_for_log(result)}")
                 
                 # Извлекаем generation_id для отслеживания стоимости
                 generation_id = self.get_generation_id_from_response(result)
@@ -3635,10 +3714,14 @@ class TelegramWhisperBot:
                                 logger.info("Получен текстовый ответ от API")
                                 return {'description': content, 'generation_id': generation_id}
                 
-                logger.error(f"Неожиданный формат ответа от OpenRouter API (mergeimage): {result}")
+                logger.error(
+                    f"Неожиданный формат ответа от OpenRouter API (mergeimage): {self._format_api_result_for_log(result)}"
+                )
                 return {'error': 'Неожиданный формат ответа от API'}
             else:
-                logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
+                logger.error(
+                    f"Ошибка OpenRouter API: {response.status_code} - {self._truncate_http_error_body(response.text)}"
+                )
                 return {'error': f'Ошибка API: {response.status_code}'}
                 
         except Exception as e:
