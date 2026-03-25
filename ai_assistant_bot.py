@@ -557,6 +557,18 @@ class TelegramWhisperBot:
             return text[:max_len] + f"...<truncated {len(text) - max_len} chars>"
         return text
 
+    def _single_line_log_preview(self, text: str, max_len: int = 500) -> str:
+        """Превращает фрагмент ответа API в одну строку без \\n/\\r, чтобы одна запись logging не разбивала файл на «пустые» строки."""
+        if not text:
+            return "<пусто>"
+        s = text.replace("\r\n", "\n").replace("\r", "\n")
+        s = s.replace("\n", " \\n ")
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        if len(s) > max_len:
+            return s[:max_len] + f"…<ещё {len(s) - max_len} симв.>"
+        return s
+
     def save_generated_image(self, image_bytes: bytes, image_format: str, chat_id: int, command_type: str) -> Path:
         """Сохраняет сгенерированное изображение в папку
         
@@ -2971,21 +2983,23 @@ class TelegramWhisperBot:
             if response.status_code == 200:
                 # Логируем сырой ответ для отладки
                 raw_response = response.text
-                logger.info(f"Сырой ответ Grok API: {raw_response[:500]}...")  # Первые 500 символов
-                
+                logger.info(
+                    f"Сырой ответ Grok API (длина: {len(raw_response)}): {self._single_line_log_preview(raw_response, 500)}"
+                )
+
                 try:
                     result = response.json()
-                    logger.info(f"Ответ Grok API: {result}")
+                    logger.info(f"Ответ Grok API: {self._format_api_result_for_log(result)}")
                     description = result['choices'][0]['message']['content']
                     logger.info("Описание изображения успешно получено через Grok")
                     return description
                 except json.JSONDecodeError as e:
                     logger.error(f"Ошибка парсинга JSON от Grok API: {e}")
-                    logger.error(f"Полный сырой ответ: {raw_response}")
+                    logger.error(f"Полный сырой ответ: {self._single_line_log_preview(raw_response, 2000)}")
                     return None
                 except (KeyError, IndexError) as e:
                     logger.error(f"Неожиданная структура ответа от Grok API: {e}")
-                    logger.error(f"Структура ответа: {result}")
+                    logger.error(f"Структура ответа: {self._format_api_result_for_log(result)}")
                     return None
             else:
                 logger.error(f"Ошибка Grok API: {response.status_code} - {response.text}")
@@ -3046,8 +3060,11 @@ class TelegramWhisperBot:
                     logger.error("Получен пустой ответ от OpenRouter API (describe)")
                     return None
                 
-                logger.info(f"Сырой ответ OpenRouter API (describe, длина: {len(raw_response)}): {raw_response[:500]}...")
-                
+                logger.info(
+                    f"Сырой ответ OpenRouter API (describe, длина: {len(raw_response)}): "
+                    f"{self._single_line_log_preview(raw_response, 500)}"
+                )
+
                 # Проверяем, что это действительно JSON
                 if 'application/json' not in content_type.lower():
                     logger.error(f"Получен не-JSON ответ от OpenRouter API. Content-Type: {content_type}")
@@ -3056,18 +3073,18 @@ class TelegramWhisperBot:
                 
                 try:
                     result = response.json()
-                    logger.info(f"Ответ OpenRouter API (describe): {result}")
+                    logger.info(f"Ответ OpenRouter API (describe): {self._format_api_result_for_log(result)}")
                     description = result['choices'][0]['message']['content']
                     generation_id = self.get_generation_id_from_response(result)
                     logger.info("Описание изображения успешно получено через OpenRouter")
                     return (description, generation_id)
                 except json.JSONDecodeError as e:
                     logger.error(f"Ошибка парсинга JSON от OpenRouter API (describe): {e}")
-                    logger.error(f"Полный сырой ответ: {raw_response}")
+                    logger.error(f"Полный сырой ответ: {self._single_line_log_preview(raw_response, 2000)}")
                     return None
                 except (KeyError, IndexError) as e:
                     logger.error(f"Неожиданная структура ответа от OpenRouter API (describe): {e}")
-                    logger.error(f"Структура ответа: {result}")
+                    logger.error(f"Структура ответа: {self._format_api_result_for_log(result)}")
                     return None
             else:
                 logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
@@ -3121,8 +3138,11 @@ class TelegramWhisperBot:
                     logger.error("Получен пустой ответ от OpenRouter API (ask)")
                     return None
                 
-                logger.info(f"Сырой ответ OpenRouter API (ask, длина: {len(raw_response)}): {raw_response[:500]}...")
-                
+                logger.info(
+                    f"Сырой ответ OpenRouter API (ask, длина: {len(raw_response)}): "
+                    f"{self._single_line_log_preview(raw_response, 500)}"
+                )
+
                 if 'application/json' not in content_type.lower():
                     logger.error(f"Получен не-JSON ответ от OpenRouter API. Content-Type: {content_type}")
                     logger.error(f"Полный ответ: {raw_response}")
@@ -3130,18 +3150,18 @@ class TelegramWhisperBot:
                 
                 try:
                     result = response.json()
-                    logger.info(f"Ответ OpenRouter API (ask): {result}")
+                    logger.info(f"Ответ OpenRouter API (ask): {self._format_api_result_for_log(result)}")
                     response_text = result['choices'][0]['message']['content']
                     generation_id = self.get_generation_id_from_response(result)
                     logger.info("Текстовый ответ успешно получен через OpenRouter")
                     return (response_text, generation_id)
                 except json.JSONDecodeError as e:
                     logger.error(f"Ошибка парсинга JSON от OpenRouter API (ask): {e}")
-                    logger.error(f"Полный сырой ответ: {raw_response}")
+                    logger.error(f"Полный сырой ответ: {self._single_line_log_preview(raw_response, 2000)}")
                     return None
                 except (KeyError, IndexError) as e:
                     logger.error(f"Неожиданная структура ответа от OpenRouter API (ask): {e}")
-                    logger.error(f"Структура ответа: {result}")
+                    logger.error(f"Структура ответа: {self._format_api_result_for_log(result)}")
                     return None
             else:
                 logger.error(f"Ошибка OpenRouter API: {response.status_code} - {response.text}")
