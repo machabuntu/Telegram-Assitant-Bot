@@ -5030,6 +5030,48 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка при объявлении победителя турнира: {e}", exc_info=True)
 
+    async def reglist_command(self, update, context):
+        """Пронумерованный список никнеймов зарегистрировавшихся на текущий турнир (без @ и без имён бойцов)."""
+        try:
+            tournament_id = self._get_current_tournament_id()
+            if not tournament_id:
+                await update.message.reply_text(
+                    "Сейчас нет турнира в фазе регистрации или проведения — список недоступен."
+                )
+                return
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, username FROM tournament_registrations "
+                "WHERE tournament_id=? AND disqualified=0 ORDER BY id ASC",
+                (tournament_id,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                await update.message.reply_text(
+                    f"На турнир {tournament_id} пока никто не зарегистрировался."
+                )
+                return
+
+            lines = []
+            for i, (uid, username) in enumerate(rows, 1):
+                name = (username or "").strip()
+                if name.startswith("@"):
+                    name = name[1:].strip()
+                if not name:
+                    name = f"id{uid}"
+                lines.append(f"{i}. {name}")
+
+            text = f"Участники турнира {tournament_id}:\n\n" + "\n".join(lines)
+            await update.message.reply_text(text)
+
+        except Exception as e:
+            logger.error(f"Ошибка при показе списка регистраций: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при получении списка регистраций.")
+
     async def banlist_command(self, update, context):
         """Показывает список забаненных бойцов."""
         try:
@@ -5112,6 +5154,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("reload", self.reload_command))
         # Турнирные команды
         self.application.add_handler(CommandHandler("reg", self.reg_command))
+        self.application.add_handler(CommandHandler("reglist", self.reglist_command))
         self.application.add_handler(CommandHandler("banlist", self.banlist_command))
         self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
         # Добавляем обработчик для callback кнопок (выбор модели и навигация)
