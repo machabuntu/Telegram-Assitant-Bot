@@ -4473,12 +4473,12 @@ class TelegramWhisperBot:
         while size < n:
             size *= 2
 
-        # Перемешиваем и дополняем BYE-слотами
-        seeded = list(participants)
-        random.shuffle(seeded)
+        # Добавляем BYE-слоты ДО перемешивания, чтобы они оказались в случайных позициях сетки
         bye_slot = {"user_id": None, "username": None, "fighter_name": "BYE"}
+        seeded = list(participants)
         while len(seeded) < size:
-            seeded.append(bye_slot)
+            seeded.append(dict(bye_slot))
+        random.shuffle(seeded)
 
         num_rounds = int(math.log2(size))
         rounds = []
@@ -4884,12 +4884,15 @@ class TelegramWhisperBot:
                     round_label = f"Раунд {rnd['round_number']}, матч {m_idx + 1}"
 
                     # BYE — автопобеда
+                    was_bye = False
                     if p2.get("fighter_name") == "BYE":
                         winner = p1
                         story = f"⚡ {fighter1} получает автоматическую победу (BYE)."
+                        was_bye = True
                     elif p1.get("fighter_name") == "BYE":
                         winner = p2
                         story = f"⚡ {fighter2} получает автоматическую победу (BYE)."
+                        was_bye = True
                     else:
                         # Отправляем в канал анонс боя
                         await context.bot.send_message(
@@ -4986,14 +4989,6 @@ class TelegramWhisperBot:
                     break
 
             if found:
-                # Проверяем, есть ли ещё необработанные матчи
-                has_more = any(
-                    not m["processed"] and m["player1"].get("fighter_name") != "TBD"
-                    and m["player2"].get("fighter_name") != "TBD"
-                    for rnd in bracket["rounds"]
-                    for m in rnd["matches"]
-                )
-                # Также смотрим на матчи где один из TBD — их скоро заполнят
                 has_remaining = any(
                     not m["processed"]
                     for rnd in bracket["rounds"]
@@ -5001,7 +4996,13 @@ class TelegramWhisperBot:
                 )
 
                 if has_remaining:
-                    context.job_queue.run_once(self.process_next_match, when=timedelta(minutes=30))
+                    if was_bye:
+                        # Фрислот не занимает турнирное время — следующий матч немедленно
+                        next_delay = timedelta(seconds=1)
+                    else:
+                        interval_min = int(self.config.get("tournament_match_interval_minutes", 30))
+                        next_delay = timedelta(minutes=interval_min)
+                    context.job_queue.run_once(self.process_next_match, when=next_delay)
                 else:
                     await self.announce_tournament_winner(context, bracket, tournament_id)
             else:
@@ -5077,13 +5078,23 @@ class TelegramWhisperBot:
                 if sf.get("user_id"):
                     update_score(sf["user_id"], sf.get("username", ""), 1, "semifinal_places")
 
-            # Добавляем чемпиона в банлист
+            # Добавляем все призовые места в банлист (1-е, 2-е и оба 3-х)
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO tournament_bans (fighter_name, banned_at, tournament_id) VALUES (?, ?, ?)",
-                (champion.get("fighter_name", ""), datetime.now().isoformat(), tournament_id)
-            )
+            ban_entries = []
+            if champion.get("fighter_name"):
+                ban_entries.append(champion["fighter_name"])
+            if finalist and finalist.get("fighter_name") and finalist.get("user_id"):
+                ban_entries.append(finalist["fighter_name"])
+            for sf in semifinalists:
+                if sf.get("fighter_name") and sf.get("user_id"):
+                    ban_entries.append(sf["fighter_name"])
+            now_iso = datetime.now().isoformat()
+            for name in ban_entries:
+                cursor.execute(
+                    "INSERT INTO tournament_bans (fighter_name, banned_at, tournament_id) VALUES (?, ?, ?)",
+                    (name, now_iso, tournament_id)
+                )
             cursor.execute(
                 "UPDATE tournaments SET status='completed', completed_at=? WHERE tournament_id=?",
                 (datetime.now().isoformat(), tournament_id)
