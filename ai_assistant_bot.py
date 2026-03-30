@@ -4364,11 +4364,9 @@ class TelegramWhisperBot:
                 f"Новая заявка: {new_fighter}"
             )
 
-            provider = api_config.get("provider", "openrouter")
-            provider_cfg = api_config.get(provider, {})
-            url = provider_cfg.get("url", "https://openrouter.ai/api/v1/chat/completions")
-            key = provider_cfg.get("key", "")
-            model = provider_cfg.get("model", "mistralai/mistral-small-2503")
+            url = api_config.get("url", "https://openrouter.ai/api/v1/chat/completions")
+            key = api_config.get("key", "")
+            model = api_config.get("model", "mistralai/mistral-small-2503")
 
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             data = {
