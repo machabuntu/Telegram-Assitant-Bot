@@ -4384,7 +4384,8 @@ class TelegramWhisperBot:
 
             answer = result["choices"][0]["message"]["content"].strip().upper()
             logger.info(f"_check_fighter_duplicate: '{new_fighter}' vs {existing_fighters} → {answer}")
-            return "ЗАНЯТО" in answer
+            # "НЕ ЗАНЯТО" contains "ЗАНЯТО" as a substring, so check the negative case first
+            return "ЗАНЯТО" in answer and "НЕ ЗАНЯТО" not in answer
 
         except Exception as e:
             logger.warning(f"_check_fighter_duplicate: ошибка ({e}), пропускаем проверку дубля")
