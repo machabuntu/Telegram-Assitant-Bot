@@ -4974,14 +4974,17 @@ class TelegramWhisperBot:
 
                     self._save_bracket(tournament_id, bracket)
 
-                    # Отправляем обновлённую сетку
-                    image_buf = self.generate_bracket_image(bracket)
-                    if image_buf:
-                        await context.bot.send_photo(
-                            chat_id=channel_id,
-                            photo=image_buf,
-                            caption=f"🏆 Обновлённая сетка ({round_label})"
-                        )
+                    # Отправляем обновлённую сетку (не критично — таймаут не должен ломать турнир)
+                    try:
+                        image_buf = self.generate_bracket_image(bracket)
+                        if image_buf:
+                            await context.bot.send_photo(
+                                chat_id=channel_id,
+                                photo=image_buf,
+                                caption=f"🏆 Обновлённая сетка ({round_label})"
+                            )
+                    except Exception as img_err:
+                        logger.warning(f"Не удалось отправить картинку сетки: {img_err}")
 
                     break  # Обрабатываем по одному матчу
                 if found:
@@ -5010,6 +5013,14 @@ class TelegramWhisperBot:
 
         except Exception as e:
             logger.error(f"Ошибка при обработке матча турнира: {e}", exc_info=True)
+            # Пытаемся запланировать следующий матч даже после ошибки,
+            # чтобы турнир не зависал навсегда
+            try:
+                from datetime import timedelta
+                context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=30))
+                logger.info("Запланирована повторная попытка process_next_match через 30 секунд")
+            except Exception:
+                logger.error("Не удалось запланировать повторную попытку", exc_info=True)
 
     async def announce_tournament_winner(self, context, bracket: dict, tournament_id: str):
         """Объявляет победителя турнира и обновляет очки/банлист."""
@@ -5252,6 +5263,53 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при показе таблицы лидеров: {e}", exc_info=True)
             await update.message.reply_text("❌ Ошибка при получении таблицы лидеров.")
 
+    async def resume_tournament_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /resume_tournament — возобновляет зависший турнир, планируя следующий матч."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен.")
+            return
+
+        try:
+            tournament_id = self._get_current_tournament_id()
+            if not tournament_id:
+                await update.message.reply_text("❌ Нет активного турнира.")
+                return
+
+            status = self._get_tournament_status(tournament_id)
+            if status != 'active':
+                await update.message.reply_text(f"❌ Турнир {tournament_id} не в активной фазе (статус: {status}).")
+                return
+
+            bracket = self._load_bracket(tournament_id)
+            if not bracket:
+                await update.message.reply_text("❌ Не удалось загрузить сетку.")
+                return
+
+            has_remaining = any(
+                not m["processed"]
+                for rnd in bracket["rounds"]
+                for m in rnd["matches"]
+                if m["player1"].get("fighter_name") != "TBD" and m["player2"].get("fighter_name") != "TBD"
+            )
+
+            if not has_remaining:
+                await update.message.reply_text("ℹ️ Все доступные матчи уже обработаны. Объявляю победителя...")
+                await self.announce_tournament_winner(context, bracket, tournament_id)
+                return
+
+            from datetime import timedelta
+            context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+            await update.message.reply_text(
+                f"✅ Турнир <b>{tournament_id}</b> возобновлён!\n"
+                "Следующий матч начнётся через 5 секунд.",
+                parse_mode='HTML'
+            )
+            logger.info(f"Турнир {tournament_id} возобновлён вручную через /resume_tournament")
+
+        except Exception as e:
+            logger.error(f"Ошибка при возобновлении турнира: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
     def setup_handlers(self):
         """Настраивает обработчики команд"""
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -5273,6 +5331,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("reglist", self.reglist_command))
         self.application.add_handler(CommandHandler("banlist", self.banlist_command))
         self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
+        self.application.add_handler(CommandHandler("resume_tournament", self.resume_tournament_command))
         # Добавляем обработчик для callback кнопок (выбор модели и навигация)
         # Без pattern, чтобы не пропускать неожиданные callback_data и упростить отладку
         self.application.add_handler(CallbackQueryHandler(self.model_callback))
