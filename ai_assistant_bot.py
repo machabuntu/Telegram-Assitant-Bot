@@ -4455,117 +4455,301 @@ class TelegramWhisperBot:
             return []
 
     def build_bracket(self, participants: list) -> dict:
-        """Строит сетку single-elimination из списка участников.
-        
-        Args:
-            participants: list of dict {user_id, username, fighter_name}
-        
-        Returns:
-            dict — структура турнирной сетки
+        """Строит швейцарскую турнирную сетку.
+
+        Генерирует только 1-й раунд (случайные пары).
+        Последующие раунды создаются динамически после завершения каждого раунда.
         """
         import math
         import random
 
         n = len(participants)
-        # Ближайшая степень двойки
-        size = 1
-        while size < n:
-            size *= 2
+        total_rounds = max(2, math.ceil(math.log2(n)))
+        config_rounds = self.config.get("tournament_swiss_rounds")
+        if config_rounds:
+            total_rounds = int(config_rounds)
 
-        # Добавляем BYE-слоты ДО перемешивания, чтобы они оказались в случайных позициях сетки
-        bye_slot = {"user_id": None, "username": None, "fighter_name": "BYE"}
-        seeded = list(participants)
-        while len(seeded) < size:
-            seeded.append(dict(bye_slot))
-        random.shuffle(seeded)
+        shuffled = list(participants)
+        random.shuffle(shuffled)
 
-        num_rounds = int(math.log2(size))
-        rounds = []
-        match_num = 1
-
-        # Первый раунд — из начального списка
         first_round_matches = []
-        for i in range(0, size, 2):
+        active = list(shuffled)
+
+        if len(active) % 2 == 1:
+            bye_player = active.pop()
             first_round_matches.append({
-                "match_id": f"1-{match_num}",
-                "player1": seeded[i],
-                "player2": seeded[i + 1],
+                "match_id": "1-bye",
+                "player1": bye_player,
+                "player2": {"user_id": None, "username": None, "fighter_name": "BYE"},
+                "winner_user_id": bye_player["user_id"],
+                "winner_fighter": bye_player["fighter_name"],
+                "story": f"⚡ {bye_player['fighter_name']} получает автоматическую победу (BYE).",
+                "processed": True,
+                "is_bye": True
+            })
+
+        for i in range(0, len(active), 2):
+            first_round_matches.append({
+                "match_id": f"1-{i // 2 + 1}",
+                "player1": active[i],
+                "player2": active[i + 1],
                 "winner_user_id": None,
                 "winner_fighter": None,
                 "story": None,
-                "processed": False
+                "processed": False,
+                "is_bye": False
             })
-            match_num += 1
-
-        rounds.append({"round_number": 1, "matches": first_round_matches})
-
-        # Остальные раунды — пустые слоты TBD
-        tbd = {"user_id": None, "username": None, "fighter_name": "TBD"}
-        for r in range(2, num_rounds + 1):
-            count = size // (2 ** r)
-            matches = []
-            for i in range(count):
-                matches.append({
-                    "match_id": f"{r}-{i+1}",
-                    "player1": dict(tbd),
-                    "player2": dict(tbd),
-                    "winner_user_id": None,
-                    "winner_fighter": None,
-                    "story": None,
-                    "processed": False
-                })
-            rounds.append({"round_number": r, "matches": matches})
 
         return {
+            "system": "swiss",
             "participants": participants,
-            "rounds": rounds,
-            "current_round": 0,
-            "current_match": 0,
+            "total_rounds": total_rounds,
+            "rounds": [{"round_number": 1, "matches": first_round_matches}],
+            "tiebreaker_matches": [],
+            "phase": "swiss",
             "champion_user_id": None,
             "champion_fighter": None
         }
 
+    def compute_standings(self, bracket: dict) -> list:
+        """Считает очки/победы/поражения каждого участника по раундам швейцарки.
+
+        Тай-брейк-матчи НЕ влияют на очки — они используются только для
+        разрешения ничьих при определении топ-3.
+        """
+        stats = {}
+        for p in bracket["participants"]:
+            uid = p["user_id"]
+            stats[uid] = {"player": dict(p), "points": 0, "wins": 0, "losses": 0, "byes": 0}
+
+        all_matches = []
+        for rnd in bracket.get("rounds", []):
+            all_matches.extend(rnd["matches"])
+
+        for match in all_matches:
+            if not match["processed"]:
+                continue
+            p1 = match["player1"]
+            p2 = match["player2"]
+            winner_uid = match.get("winner_user_id")
+
+            if match.get("is_bye"):
+                real = p1 if p1.get("user_id") else p2
+                if real["user_id"] in stats:
+                    stats[real["user_id"]]["points"] += 1
+                    stats[real["user_id"]]["byes"] += 1
+                continue
+
+            if winner_uid and p1.get("user_id") and p2.get("user_id"):
+                loser_uid = p2["user_id"] if winner_uid == p1["user_id"] else p1["user_id"]
+                if winner_uid in stats:
+                    stats[winner_uid]["points"] += 1
+                    stats[winner_uid]["wins"] += 1
+                if loser_uid in stats:
+                    stats[loser_uid]["losses"] += 1
+
+        return sorted(stats.values(), key=lambda x: (-x["points"], -x["wins"]))
+
+    def generate_swiss_pairings(self, bracket: dict, round_number: int) -> list:
+        """Жеребьёвка для очередного раунда швейцарки.
+
+        Пары формируются по текущим очкам (близкие очки играют друг с другом),
+        рематчи избегаются по возможности, при нечётном числе участников
+        слабейший без предыдущего BYE получает BYE.
+        """
+        standings = self.compute_standings(bracket)
+
+        played = set()
+        bye_uids = set()
+        for rnd in bracket["rounds"]:
+            for m in rnd["matches"]:
+                if m.get("is_bye"):
+                    real = m["player1"] if m["player1"].get("user_id") else m["player2"]
+                    bye_uids.add(real["user_id"])
+                else:
+                    uid1 = m["player1"].get("user_id")
+                    uid2 = m["player2"].get("user_id")
+                    if uid1 and uid2:
+                        played.add(frozenset([uid1, uid2]))
+
+        players = [s["player"] for s in standings]
+        matches = []
+        bye_match = None
+
+        if len(players) % 2 == 1:
+            chosen = None
+            for i in range(len(players) - 1, -1, -1):
+                if players[i]["user_id"] not in bye_uids:
+                    chosen = i
+                    break
+            if chosen is None:
+                chosen = len(players) - 1
+            bye_player = players.pop(chosen)
+            bye_match = {
+                "match_id": f"{round_number}-bye",
+                "player1": bye_player,
+                "player2": {"user_id": None, "username": None, "fighter_name": "BYE"},
+                "winner_user_id": bye_player["user_id"],
+                "winner_fighter": bye_player["fighter_name"],
+                "story": f"⚡ {bye_player['fighter_name']} получает автоматическую победу (BYE).",
+                "processed": True,
+                "is_bye": True
+            }
+
+        paired = [False] * len(players)
+        match_num = 1
+        for i in range(len(players)):
+            if paired[i]:
+                continue
+            best_j = None
+            for j in range(i + 1, len(players)):
+                if paired[j]:
+                    continue
+                if frozenset([players[i]["user_id"], players[j]["user_id"]]) not in played:
+                    best_j = j
+                    break
+            if best_j is None:
+                for j in range(i + 1, len(players)):
+                    if not paired[j]:
+                        best_j = j
+                        break
+            if best_j is not None:
+                matches.append({
+                    "match_id": f"{round_number}-{match_num}",
+                    "player1": players[i],
+                    "player2": players[best_j],
+                    "winner_user_id": None,
+                    "winner_fighter": None,
+                    "story": None,
+                    "processed": False,
+                    "is_bye": False
+                })
+                paired[i] = True
+                paired[best_j] = True
+                match_num += 1
+
+        if bye_match:
+            matches.append(bye_match)
+        return matches
+
+    def resolve_tiebreakers(self, bracket: dict):
+        """Определяет топ-3 с учётом тай-брейков.
+
+        Returns:
+            (top3_list, pending_matches_or_None)
+            top3_list  — список player-dict в порядке мест (может быть <3 если ещё не разрешено)
+            pending    — None если все места определены, иначе список матчей для доигрывания
+        """
+        standings = self.compute_standings(bracket)
+        if not standings:
+            return [], None
+
+        h2h = {}
+        all_matches = []
+        for rnd in bracket.get("rounds", []):
+            all_matches.extend(rnd["matches"])
+        all_matches.extend(bracket.get("tiebreaker_matches", []))
+
+        for m in all_matches:
+            if not m["processed"] or m.get("is_bye"):
+                continue
+            uid1 = m["player1"].get("user_id")
+            uid2 = m["player2"].get("user_id")
+            w = m.get("winner_user_id")
+            if uid1 and uid2 and w:
+                h2h[frozenset([uid1, uid2])] = w
+
+        groups = []
+        cur_group, cur_pts = [], None
+        for s in standings:
+            if s["points"] != cur_pts:
+                if cur_group:
+                    groups.append(cur_group)
+                cur_group = [s]
+                cur_pts = s["points"]
+            else:
+                cur_group.append(s)
+        if cur_group:
+            groups.append(cur_group)
+
+        resolved = []
+        for group in groups:
+            pos_start = len(resolved) + 1
+            if pos_start > 3:
+                for g in group:
+                    resolved.append(g["player"])
+                continue
+
+            if len(group) == 1:
+                resolved.append(group[0]["player"])
+                continue
+
+            slots_left = 3 - len(resolved)
+
+            if len(group) <= slots_left:
+                for g in group:
+                    resolved.append(g["player"])
+                continue
+
+            group_uids = [g["player"]["user_id"] for g in group]
+            uid_to_player = {g["player"]["user_id"]: g["player"] for g in group}
+
+            missing = []
+            for i, uid1 in enumerate(group_uids):
+                for uid2 in group_uids[i + 1:]:
+                    if frozenset([uid1, uid2]) not in h2h:
+                        missing.append((uid1, uid2))
+
+            if missing:
+                pending = []
+                existing = {
+                    frozenset([m["player1"].get("user_id"), m["player2"].get("user_id")])
+                    for m in bracket.get("tiebreaker_matches", [])
+                }
+                for uid1, uid2 in missing:
+                    if frozenset([uid1, uid2]) not in existing:
+                        pending.append({
+                            "match_id": f"tb-{uid1}-{uid2}",
+                            "player1": uid_to_player[uid1],
+                            "player2": uid_to_player[uid2],
+                            "winner_user_id": None,
+                            "winner_fighter": None,
+                            "story": None,
+                            "processed": False,
+                            "is_bye": False
+                        })
+                if pending:
+                    return resolved, pending
+
+            h2h_wins = {uid: 0 for uid in group_uids}
+            for i, uid1 in enumerate(group_uids):
+                for uid2 in group_uids[i + 1:]:
+                    key = frozenset([uid1, uid2])
+                    if key in h2h:
+                        h2h_wins[h2h[key]] += 1
+            group.sort(key=lambda g: -h2h_wins[g["player"]["user_id"]])
+            for g in group:
+                resolved.append(g["player"])
+
+        return resolved[:3], None
+
     def generate_bracket_image(self, bracket: dict) -> 'BytesIO':
-        """Генерирует PNG-картинку турнирной сетки с помощью Pillow."""
+        """Генерирует PNG-картинку турнирной таблицы (standings) швейцарской системы."""
         try:
             from PIL import Image, ImageDraw, ImageFont
 
-            rounds = bracket["rounds"]
-            num_rounds = len(rounds)
-            max_slots = len(rounds[0]["matches"]) * 2  # участников в первом раунде
+            standings = self.compute_standings(bracket)
+            if not standings:
+                return None
 
-            BOX_W = 240
-            BOX_H = 44
-            H_GAP = 60      # горизонтальный промежуток между раундами
-            V_PAD = 14      # вертикальный отступ внутри матча
-
-            def slot_y(round_idx: int, slot_idx: int) -> int:
-                """Y-координата центра слота (участника) в раунде."""
-                slots_in_round = len(rounds[round_idx]["matches"]) * 2
-                spacing = max_slots / slots_in_round
-                return int((slot_idx + 0.5) * spacing * (BOX_H + V_PAD * 2))
-
-            canvas_h = max_slots * (BOX_H + V_PAD * 2) + 60
-            canvas_w = num_rounds * (BOX_W + H_GAP) + H_GAP + 20
-
-            img = Image.new("RGB", (canvas_w, canvas_h), color=(24, 24, 32))
-            draw = ImageDraw.Draw(img)
-
-            # Font candidates — ordered by preference, all support Cyrillic.
-            # Covers Linux (DejaVu/Liberation/Ubuntu/FreeSans) and Windows (Arial).
             _FONT_CANDIDATES = [
-                # DejaVu — ships with most Linux distros
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                 "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-                # Liberation (RHEL/CentOS/Fedora)
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                 "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-                # Ubuntu fonts
                 "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
                 "/usr/share/fonts/truetype/ubuntu-font-family/Ubuntu-R.ttf",
-                # FreeSans (older Debian/Ubuntu)
                 "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-                # Windows fallback
                 "arial.ttf",
                 "C:/Windows/Fonts/arial.ttf",
             ]
@@ -4587,78 +4771,104 @@ class TelegramWhisperBot:
                         return ImageFont.truetype(path, size)
                     except Exception:
                         continue
-                # Last resort: Pillow's built-in default (no Cyrillic but never crashes)
                 return ImageFont.load_default()
 
             font       = _load_font(_FONT_CANDIDATES,      14)
             font_bold  = _load_font(_FONT_BOLD_CANDIDATES, 15)
             font_small = _load_font(_FONT_CANDIDATES,      12)
+            font_hdr   = _load_font(_FONT_BOLD_CANDIDATES, 13)
 
-            # Цвета
-            C_BOX_DEFAULT = (45, 45, 60)
-            C_BOX_WINNER = (30, 100, 50)
-            C_BOX_LOSER = (60, 30, 30)
-            C_BOX_BYE = (35, 35, 45)
+            COL_RANK = 44
+            COL_FIGHTER = 210
+            COL_USER = 150
+            COL_PTS = 54
+            COL_WL = 80
+            TABLE_W = COL_RANK + COL_FIGHTER + COL_USER + COL_PTS + COL_WL
+            ROW_H = 34
+            HEADER_H = 36
+            MARGIN = 16
+            TITLE_H = 40
+
+            num_rows = len(standings)
+            canvas_w = TABLE_W + 2 * MARGIN
+            canvas_h = TITLE_H + HEADER_H + num_rows * ROW_H + MARGIN
+
+            img = Image.new("RGB", (canvas_w, canvas_h), color=(24, 24, 32))
+            draw = ImageDraw.Draw(img)
+
             C_TEXT = (220, 220, 220)
-            C_TEXT_DIM = (110, 110, 110)
-            C_LINE = (80, 80, 100)
-            C_HEADER = (160, 130, 255)
+            C_TEXT_DIM = (140, 140, 140)
+            C_HEADER_BG = (35, 35, 50)
+            C_HEADER_TEXT = (160, 130, 255)
+            C_GOLD = (50, 45, 20)
+            C_SILVER = (42, 42, 50)
+            C_BRONZE = (48, 38, 28)
+            C_ROW_ODD = (30, 30, 40)
+            C_ROW_EVEN = (26, 26, 36)
 
-            round_labels = ["1/8", "1/4", "Полуфинал", "Финал", "Финал", "Финал"]
+            current_round = len(bracket.get("rounds", []))
+            total_rounds = bracket.get("total_rounds", "?")
+            phase = bracket.get("phase", "swiss")
+            if phase == "tiebreaker":
+                title = "Турнирная таблица — Тай-брейк"
+            elif phase == "completed":
+                title = "Итоговая турнирная таблица"
+            else:
+                title = f"Турнирная таблица — Раунд {current_round}/{total_rounds}"
+            draw.text((MARGIN, 10), title, fill=C_HEADER_TEXT, font=font_bold)
 
-            for r_idx, rnd in enumerate(rounds):
-                x = H_GAP + r_idx * (BOX_W + H_GAP)
-                label = round_labels[r_idx] if r_idx < len(round_labels) else f"Раунд {r_idx+1}"
-                draw.text((x + BOX_W // 2 - 30, 8), label, fill=C_HEADER, font=font_bold)
+            y = TITLE_H
+            draw.rectangle([MARGIN, y, MARGIN + TABLE_W, y + HEADER_H], fill=C_HEADER_BG)
+            x = MARGIN
+            for text, width in [("#", COL_RANK), ("Боец", COL_FIGHTER), ("Игрок", COL_USER), ("Очки", COL_PTS), ("В-П", COL_WL)]:
+                draw.text((x + 8, y + 10), text, fill=C_HEADER_TEXT, font=font_hdr)
+                x += width
 
-                for m_idx, match in enumerate(rnd["matches"]):
-                    slot_indices = [m_idx * 2, m_idx * 2 + 1]
-                    players = [match["player1"], match["player2"]]
-                    winner_uid = match.get("winner_user_id")
+            y = TITLE_H + HEADER_H
+            medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+            for idx, s in enumerate(standings):
+                player = s["player"]
+                if idx == 0:
+                    bg = C_GOLD
+                elif idx == 1:
+                    bg = C_SILVER
+                elif idx == 2:
+                    bg = C_BRONZE
+                elif idx % 2 == 0:
+                    bg = C_ROW_EVEN
+                else:
+                    bg = C_ROW_ODD
 
-                    for p_idx, (player, slot_i) in enumerate(zip(players, slot_indices)):
-                        cy = slot_y(r_idx, slot_i) + 30  # смещение под заголовок
-                        y = cy - BOX_H // 2
-                        fighter = player.get("fighter_name", "TBD") or "TBD"
-                        username = player.get("username")
-                        is_bye = fighter == "BYE"
-                        is_tbd = fighter == "TBD"
+                draw.rectangle([MARGIN, y, MARGIN + TABLE_W, y + ROW_H], fill=bg)
 
-                        if is_bye or is_tbd:
-                            box_color = C_BOX_BYE
-                            text_color = C_TEXT_DIM
-                        elif winner_uid is not None and player.get("user_id") == winner_uid:
-                            box_color = C_BOX_WINNER
-                            text_color = C_TEXT
-                        elif winner_uid is not None:
-                            box_color = C_BOX_LOSER
-                            text_color = C_TEXT_DIM
-                        else:
-                            box_color = C_BOX_DEFAULT
-                            text_color = C_TEXT
+                x = MARGIN
+                rank_text = medals.get(idx, f"{idx + 1}")
+                draw.text((x + 8, y + 9), rank_text, fill=C_TEXT, font=font_bold)
+                x += COL_RANK
 
-                        draw.rounded_rectangle(
-                            [x, y, x + BOX_W, y + BOX_H],
-                            radius=6, fill=box_color, outline=(70, 70, 90)
-                        )
+                name = player.get("fighter_name", "?")
+                if len(name) > 24:
+                    name = name[:21] + "..."
+                draw.text((x + 8, y + 9), name, fill=C_TEXT, font=font_bold)
+                x += COL_FIGHTER
 
-                        label_txt = fighter[:28] if len(fighter) <= 28 else fighter[:25] + "..."
-                        draw.text((x + 8, y + 5), label_txt, fill=text_color, font=font_bold)
-                        if username and not is_bye and not is_tbd:
-                            draw.text((x + 8, y + 24), f"@{username}", fill=C_TEXT_DIM, font=font_small)
+                username = player.get("username", "")
+                if username:
+                    uname = f"@{username}"
+                    if len(uname) > 18:
+                        uname = uname[:15] + "..."
+                    draw.text((x + 8, y + 9), uname, fill=C_TEXT_DIM, font=font_small)
+                x += COL_USER
 
-                    # Соединительные линии к следующему раунду
-                    if r_idx < num_rounds - 1:
-                        cy1 = slot_y(r_idx, slot_indices[0]) + 30
-                        cy2 = slot_y(r_idx, slot_indices[1]) + 30
-                        cx_right = x + BOX_W
-                        cy_mid = (cy1 + cy2) // 2
-                        next_x = cx_right + H_GAP
+                draw.text((x + 8, y + 9), str(s["points"]), fill=C_TEXT, font=font_bold)
+                x += COL_PTS
 
-                        draw.line([(cx_right, cy1), (cx_right + H_GAP // 2, cy1)], fill=C_LINE, width=2)
-                        draw.line([(cx_right, cy2), (cx_right + H_GAP // 2, cy2)], fill=C_LINE, width=2)
-                        draw.line([(cx_right + H_GAP // 2, cy1), (cx_right + H_GAP // 2, cy2)], fill=C_LINE, width=2)
-                        draw.line([(cx_right + H_GAP // 2, cy_mid), (next_x, cy_mid)], fill=C_LINE, width=2)
+                wl = f"{s['wins']}-{s['losses']}"
+                if s.get("byes"):
+                    wl += f" +{s['byes']}B"
+                draw.text((x + 8, y + 9), wl, fill=C_TEXT_DIM, font=font)
+
+                y += ROW_H
 
             buf = BytesIO()
             img.save(buf, format='PNG')
@@ -4666,7 +4876,7 @@ class TelegramWhisperBot:
             return buf
 
         except Exception as e:
-            logger.error(f"Ошибка при генерации изображения сетки: {e}", exc_info=True)
+            logger.error(f"Ошибка при генерации изображения таблицы: {e}", exc_info=True)
             return None
 
     def _save_bracket(self, tournament_id: str, bracket: dict):
@@ -4805,7 +5015,7 @@ class TelegramWhisperBot:
                 conn.close()
                 return
 
-            # Строим сетку
+            # Строим швейцарскую сетку
             bracket = self.build_bracket(participants)
             self._save_bracket(tournament_id, bracket)
 
@@ -4818,6 +5028,7 @@ class TelegramWhisperBot:
             conn.commit()
             conn.close()
 
+            total_rounds = bracket["total_rounds"]
             participants_list = "\n".join(
                 f"• <b>{p['fighter_name']}</b> (@{p['username']})" for p in participants
             )
@@ -4825,30 +5036,99 @@ class TelegramWhisperBot:
                 chat_id=channel_id,
                 text=(
                     f"🏆 <b>ТУРНИР {tournament_id} НАЧИНАЕТСЯ!</b>\n\n"
+                    f"🔀 Формат: <b>швейцарская система, {total_rounds} раундов</b>\n\n"
                     f"Участники ({len(participants)}):\n{participants_list}\n\n"
-                    "⚔️ Генерирую турнирную сетку..."
+                    "⚔️ Жеребьёвка первого раунда завершена!"
                 ),
                 parse_mode='HTML'
             )
 
-            # Отправляем сетку
             image_buf = self.generate_bracket_image(bracket)
             if image_buf:
                 await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=image_buf,
-                    caption=f"🏆 Турнирная сетка — {tournament_id}"
+                    caption=f"📊 Стартовая таблица — {tournament_id}"
                 )
 
-            # Запускаем первый бой немедленно
             from datetime import timedelta
             context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=10))
 
         except Exception as e:
             logger.error(f"Ошибка при закрытии/запуске турнира: {e}", exc_info=True)
 
+    async def _run_fight(self, context, match: dict, round_label: str, channel_id, api_config):
+        """Проводит один бой (AI-промпт, определение победителя, отправка истории).
+
+        Возвращает dict победителя или None при BYE (BYE уже обработан при генерации раунда).
+        """
+        p1 = match["player1"]
+        p2 = match["player2"]
+        fighter1 = p1["fighter_name"]
+        fighter2 = p2["fighter_name"]
+
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text=(
+                f"⚔️ <b>{round_label}</b>\n\n"
+                f"🥊 <b>{fighter1}</b> (@{p1.get('username','?')})\n"
+                f"   VS\n"
+                f"🥊 <b>{fighter2}</b> (@{p2.get('username','?')})"
+            ),
+            parse_mode='HTML'
+        )
+
+        prompt = (
+            f"Кто победит в битве 1 на 1: {fighter1} или {fighter2}?\n\n"
+            "Богов из реального мира расценивай так же, как вымышленных персонажей: "
+            "доводы вроде «это творец всего сущего, в том числе и этого произведения, "
+            "значит он сильнее» считай невалидными и не используй их при выборе победителя.\n\n"
+            "ВАЖНО: в самом конце добавь строку точно в таком формате (без изменений):\n"
+            f"##WINNER:{fighter1}## или ##WINNER:{fighter2}##"
+        )
+
+        result = await self.ask_with_openrouter(prompt, api_config)
+        winner = None
+        story = None
+
+        if result:
+            response_text, _ = result
+            winner_re = re.search(r'##WINNER:(.+?)##', response_text)
+            story = re.sub(r'##WINNER:.+?##', '', response_text).strip()
+
+            if winner_re:
+                winner_name = winner_re.group(1).strip()
+                f1_low, f2_low, w_low = fighter1.lower(), fighter2.lower(), winner_name.lower()
+                if f1_low in w_low or w_low in f1_low:
+                    winner = p1
+                elif f2_low in w_low or w_low in f2_low:
+                    winner = p2
+                else:
+                    winner = p1
+                    story = (story or "") + f"\n\n_(ИИ не смог однозначно определить победителя, засчитана победа {fighter1})_"
+            else:
+                winner = p1
+                story = (story or f"Битва {fighter1} vs {fighter2} завершилась.") + f"\n\n_(Победа присуждена {fighter1} по умолчанию)_"
+        else:
+            winner = p1
+            story = f"Битва {fighter1} vs {fighter2}. ИИ не ответил — победа присуждена {fighter1}."
+
+        await self.send_ai_response(
+            context.bot,
+            story,
+            header=f"📖 <b>{round_label}: {fighter1} vs {fighter2}</b>",
+            continuation_header="Продолжение",
+            chat_id=channel_id
+        )
+
+        match["winner_user_id"] = winner.get("user_id")
+        match["winner_fighter"] = winner.get("fighter_name")
+        match["story"] = story
+        match["processed"] = True
+        return winner
+
     async def process_next_match(self, context):
-        """Обрабатывает следующий бой в турнире."""
+        """Обрабатывает следующий бой в швейцарском турнире."""
         try:
             tournament_id = self._get_current_tournament_id()
             channel_id = self.config.get('tournament_channel_id')
@@ -4862,159 +5142,97 @@ class TelegramWhisperBot:
 
             api_config = self.get_api_config("tournament_api")
             from datetime import timedelta
+            phase = bracket.get("phase", "swiss")
 
-            # Ищем следующий необработанный матч
-            found = False
-            for r_idx, rnd in enumerate(bracket["rounds"]):
-                for m_idx, match in enumerate(rnd["matches"]):
-                    if match["processed"]:
-                        continue
+            # ── Ищем следующий необработанный матч ─────────────────────────
+            match = None
+            round_label = ""
 
-                    p1 = match["player1"]
-                    p2 = match["player2"]
+            if phase == "swiss":
+                for rnd in bracket["rounds"]:
+                    for m_idx, m in enumerate(rnd["matches"]):
+                        if not m["processed"] and not m.get("is_bye"):
+                            match = m
+                            round_label = f"Раунд {rnd['round_number']}, матч {m_idx + 1}"
+                            break
+                    if match:
+                        break
+            elif phase == "tiebreaker":
+                for m_idx, m in enumerate(bracket.get("tiebreaker_matches", [])):
+                    if not m["processed"]:
+                        match = m
+                        round_label = f"Тай-брейк, матч {m_idx + 1}"
+                        break
 
-                    # Пропускаем если слот ещё не заполнен (TBD)
-                    if p1.get("fighter_name") == "TBD" or p2.get("fighter_name") == "TBD":
-                        continue
+            # ── Если матч не найден — переход к следующей фазе ─────────────
+            if match is None:
+                if phase == "swiss":
+                    current_round_num = len(bracket["rounds"])
+                    total_rounds = bracket.get("total_rounds", current_round_num)
 
-                    found = True
-                    fighter1 = p1["fighter_name"]
-                    fighter2 = p2["fighter_name"]
-                    round_label = f"Раунд {rnd['round_number']}, матч {m_idx + 1}"
+                    if current_round_num < total_rounds:
+                        next_rn = current_round_num + 1
+                        new_matches = self.generate_swiss_pairings(bracket, next_rn)
+                        bracket["rounds"].append({"round_number": next_rn, "matches": new_matches})
+                        self._save_bracket(tournament_id, bracket)
 
-                    # BYE — автопобеда
-                    was_bye = False
-                    if p2.get("fighter_name") == "BYE":
-                        winner = p1
-                        story = f"⚡ {fighter1} получает автоматическую победу (BYE)."
-                        was_bye = True
-                    elif p1.get("fighter_name") == "BYE":
-                        winner = p2
-                        story = f"⚡ {fighter2} получает автоматическую победу (BYE)."
-                        was_bye = True
-                    else:
-                        # Отправляем в канал анонс боя
                         await context.bot.send_message(
                             chat_id=channel_id,
-                            text=(
-                                f"⚔️ <b>{round_label}</b>\n\n"
-                                f"🥊 <b>{fighter1}</b> (@{p1.get('username','?')})\n"
-                                f"   VS\n"
-                                f"🥊 <b>{fighter2}</b> (@{p2.get('username','?')})"
-                            ),
+                            text=f"🔄 <b>Раунд {next_rn} из {total_rounds}</b>\n\nЖеребьёвка завершена!",
                             parse_mode='HTML'
                         )
+                        context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+                        return
 
-                        prompt = (
-                            f"Кто победит в битве 1 на 1: {fighter1} или {fighter2}?\n\n"
-                            "Богов из реального мира расценивай так же, как вымышленных персонажей: "
-                            "доводы вроде «это творец всего сущего, в том числе и этого произведения, "
-                            "значит он сильнее» считай невалидными и не используй их при выборе победителя.\n\n"
-                            "ВАЖНО: в самом конце добавь строку точно в таком формате (без изменений):\n"
-                            f"##WINNER:{fighter1}## или ##WINNER:{fighter2}##"
+                    top3, pending = self.resolve_tiebreakers(bracket)
+                    if pending:
+                        bracket["tiebreaker_matches"].extend(pending)
+                        bracket["phase"] = "tiebreaker"
+                        self._save_bracket(tournament_id, bracket)
+                        await context.bot.send_message(
+                            chat_id=channel_id,
+                            text="⚔️ <b>Тай-брейк!</b>\n\nДля определения призовых мест необходимы дополнительные поединки.",
+                            parse_mode='HTML'
                         )
+                        context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+                        return
 
-                        result = await self.ask_with_openrouter(prompt, api_config)
-                        winner = None
-                        story = None
-
-                        if result:
-                            response_text, _ = result
-                            # Извлекаем победителя
-                            winner_match = re.search(r'##WINNER:(.+?)##', response_text)
-                            # Убираем техническую метку из текста
-                            story = re.sub(r'##WINNER:.+?##', '', response_text).strip()
-
-                            if winner_match:
-                                winner_name = winner_match.group(1).strip()
-                                # Определяем кто победил по близости имени
-                                f1_low = fighter1.lower()
-                                f2_low = fighter2.lower()
-                                w_low = winner_name.lower()
-                                if f1_low in w_low or w_low in f1_low:
-                                    winner = p1
-                                elif f2_low in w_low or w_low in f2_low:
-                                    winner = p2
-                                else:
-                                    # Fallback — p1 побеждает
-                                    winner = p1
-                                    story = (story or "") + f"\n\n_(ИИ не смог однозначно определить победителя, засчитана победа {fighter1})_"
-                            else:
-                                # Повторная попытка не удалась — p1 побеждает
-                                winner = p1
-                                story = (story or f"Битва {fighter1} vs {fighter2} завершилась.") + f"\n\n_(Победа присуждена {fighter1} по умолчанию)_"
-                        else:
-                            winner = p1
-                            story = f"Битва {fighter1} vs {fighter2}. ИИ не ответил — победа присуждена {fighter1}."
-
-                        # Отправляем историю боя в канал
-                        await self.send_ai_response(
-                            context.bot,
-                            story,
-                            header=f"📖 <b>{round_label}: {fighter1} vs {fighter2}</b>",
-                            continuation_header="Продолжение",
-                            chat_id=channel_id
-                        )
-
-                    # Обновляем матч
-                    match["winner_user_id"] = winner.get("user_id")
-                    match["winner_fighter"] = winner.get("fighter_name")
-                    match["story"] = story
-                    match["processed"] = True
-
-                    # Продвигаем победителя в следующий раунд
-                    next_r_idx = r_idx + 1
-                    if next_r_idx < len(bracket["rounds"]):
-                        next_match_idx = m_idx // 2
-                        next_match = bracket["rounds"][next_r_idx]["matches"][next_match_idx]
-                        if m_idx % 2 == 0:
-                            next_match["player1"] = winner
-                        else:
-                            next_match["player2"] = winner
-
-                    self._save_bracket(tournament_id, bracket)
-
-                    # Отправляем обновлённую сетку (не критично — таймаут не должен ломать турнир)
-                    try:
-                        image_buf = self.generate_bracket_image(bracket)
-                        if image_buf:
-                            await context.bot.send_photo(
-                                chat_id=channel_id,
-                                photo=image_buf,
-                                caption=f"🏆 Обновлённая сетка ({round_label})"
-                            )
-                    except Exception as img_err:
-                        logger.warning(f"Не удалось отправить картинку сетки: {img_err}")
-
-                    break  # Обрабатываем по одному матчу
-                if found:
-                    break
-
-            if found:
-                has_remaining = any(
-                    not m["processed"]
-                    for rnd in bracket["rounds"]
-                    for m in rnd["matches"]
-                )
-
-                if has_remaining:
-                    if was_bye:
-                        # Фрислот не занимает турнирное время — следующий матч немедленно
-                        next_delay = timedelta(seconds=1)
-                    else:
-                        interval_min = int(self.config.get("tournament_match_interval_minutes", 30))
-                        next_delay = timedelta(minutes=interval_min)
-                    context.job_queue.run_once(self.process_next_match, when=next_delay)
-                else:
                     await self.announce_tournament_winner(context, bracket, tournament_id)
-            else:
-                # Все матчи обработаны
-                await self.announce_tournament_winner(context, bracket, tournament_id)
+                    return
+
+                elif phase == "tiebreaker":
+                    top3, pending = self.resolve_tiebreakers(bracket)
+                    if pending:
+                        bracket["tiebreaker_matches"].extend(pending)
+                        self._save_bracket(tournament_id, bracket)
+                        context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+                        return
+                    await self.announce_tournament_winner(context, bracket, tournament_id)
+                    return
+                return
+
+            # ── Проводим бой ───────────────────────────────────────────────
+            await self._run_fight(context, match, round_label, channel_id, api_config)
+            self._save_bracket(tournament_id, bracket)
+
+            # Публикуем таблицу
+            try:
+                image_buf = self.generate_bracket_image(bracket)
+                if image_buf:
+                    await context.bot.send_photo(
+                        chat_id=channel_id,
+                        photo=image_buf,
+                        caption=f"📊 Таблица после: {round_label}"
+                    )
+            except Exception as img_err:
+                logger.warning(f"Не удалось отправить таблицу: {img_err}")
+
+            # ── Планируем следующий шаг ────────────────────────────────────
+            interval_min = int(self.config.get("tournament_match_interval_minutes", 30))
+            context.job_queue.run_once(self.process_next_match, when=timedelta(minutes=interval_min))
 
         except Exception as e:
             logger.error(f"Ошибка при обработке матча турнира: {e}", exc_info=True)
-            # Пытаемся запланировать следующий матч даже после ошибки,
-            # чтобы турнир не зависал навсегда
             try:
                 from datetime import timedelta
                 context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=30))
@@ -5023,46 +5241,32 @@ class TelegramWhisperBot:
                 logger.error("Не удалось запланировать повторную попытку", exc_info=True)
 
     async def announce_tournament_winner(self, context, bracket: dict, tournament_id: str):
-        """Объявляет победителя турнира и обновляет очки/банлист."""
+        """Объявляет победителя турнира (швейцарская система) и обновляет очки/банлист."""
         try:
             channel_id = self.config.get('tournament_channel_id')
+            from datetime import timedelta
 
-            # Находим чемпиона — победитель последнего матча
-            last_round = bracket["rounds"][-1]
-            champion = None
-            finalist = None
-
-            if last_round["matches"]:
-                final_match = last_round["matches"][0]
-                winner_uid = final_match.get("winner_user_id")
-                winner_fighter = final_match.get("winner_fighter")
-
-                p1 = final_match["player1"]
-                p2 = final_match["player2"]
-
-                if winner_uid == p1.get("user_id"):
-                    champion = p1
-                    finalist = p2
-                else:
-                    champion = p2
-                    finalist = p1
-
-            if not champion:
-                # Если финал не сыгран, берём из participants кто остался
-                logger.warning("Не удалось определить чемпиона из финального матча")
+            top3, pending = self.resolve_tiebreakers(bracket)
+            if pending:
+                bracket.setdefault("tiebreaker_matches", []).extend(pending)
+                bracket["phase"] = "tiebreaker"
+                self._save_bracket(tournament_id, bracket)
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text="⚔️ <b>Тай-брейк!</b>\n\nДля определения призовых мест необходимы дополнительные поединки.",
+                    parse_mode='HTML'
+                )
+                context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
                 return
 
-            # Находим полуфиналистов (проигравшие в предпоследнем раунде)
-            semifinalists = []
-            if len(bracket["rounds"]) >= 2:
-                semi_round = bracket["rounds"][-2]
-                for match in semi_round["matches"]:
-                    w_uid = match.get("winner_user_id")
-                    for player in [match["player1"], match["player2"]]:
-                        if player.get("user_id") and player.get("user_id") != w_uid:
-                            semifinalists.append(player)
+            if not top3:
+                logger.warning("Не удалось определить призёров турнира")
+                return
 
-            # Обновляем очки в БД
+            champion = top3[0]
+            finalist = top3[1] if len(top3) > 1 else None
+            third = top3[2] if len(top3) > 2 else None
+
             def update_score(user_id, username, points, field):
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
@@ -5084,57 +5288,48 @@ class TelegramWhisperBot:
                 update_score(champion["user_id"], champion.get("username", ""), 5, "first_places")
             if finalist and finalist.get("user_id"):
                 update_score(finalist["user_id"], finalist.get("username", ""), 3, "second_places")
-            for sf in semifinalists:
-                if sf.get("user_id"):
-                    update_score(sf["user_id"], sf.get("username", ""), 1, "semifinal_places")
+            if third and third.get("user_id"):
+                update_score(third["user_id"], third.get("username", ""), 1, "semifinal_places")
 
-            # Добавляем все призовые места в банлист (1-е, 2-е и оба 3-х)
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            ban_entries = []
-            if champion.get("fighter_name"):
-                ban_entries.append(champion["fighter_name"])
-            if finalist and finalist.get("fighter_name") and finalist.get("user_id"):
-                ban_entries.append(finalist["fighter_name"])
-            for sf in semifinalists:
-                if sf.get("fighter_name") and sf.get("user_id"):
-                    ban_entries.append(sf["fighter_name"])
             now_iso = datetime.now().isoformat()
-            for name in ban_entries:
-                cursor.execute(
-                    "INSERT INTO tournament_bans (fighter_name, banned_at, tournament_id) VALUES (?, ?, ?)",
-                    (name, now_iso, tournament_id)
-                )
+            for p in top3:
+                if p.get("fighter_name") and p.get("user_id"):
+                    cursor.execute(
+                        "INSERT INTO tournament_bans (fighter_name, banned_at, tournament_id) VALUES (?, ?, ?)",
+                        (p["fighter_name"], now_iso, tournament_id)
+                    )
             cursor.execute(
                 "UPDATE tournaments SET status='completed', completed_at=? WHERE tournament_id=?",
-                (datetime.now().isoformat(), tournament_id)
+                (now_iso, tournament_id)
             )
             conn.commit()
             conn.close()
 
+            bracket["phase"] = "completed"
             bracket["champion_user_id"] = champion.get("user_id")
             bracket["champion_fighter"] = champion.get("fighter_name")
             self._save_bracket(tournament_id, bracket)
 
-            # Финальная картинка сетки
             image_buf = self.generate_bracket_image(bracket)
 
-            semi_text = ""
-            if semifinalists:
-                semi_lines = "\n".join(
-                    f"🥉 <b>{s.get('fighter_name')}</b> (@{s.get('username','?')}) — 1 очко"
-                    for s in semifinalists
+            third_text = ""
+            if third:
+                third_text = (
+                    f"\n\n🥉 3-е место: <b>{third.get('fighter_name', '—')}</b>"
+                    f" (@{third.get('username', '?')}) — 1 очко"
                 )
-                semi_text = f"\n\n{semi_lines}"
 
+            ban_names = [p.get("fighter_name") for p in top3 if p.get("fighter_name")]
             announcement = (
                 f"🏆 <b>ТУРНИР {tournament_id} ЗАВЕРШЁН!</b>\n\n"
                 f"🥇 <b>ЧЕМПИОН: {champion.get('fighter_name')}</b>\n"
                 f"   (@{champion.get('username','?')}) — 5 очков\n\n"
-                f"🥈 Финалист: <b>{finalist.get('fighter_name') if finalist else '—'}</b>"
+                f"🥈 2-е место: <b>{finalist.get('fighter_name') if finalist else '—'}</b>"
                 f" (@{finalist.get('username','?') if finalist else '?'}) — 3 очка"
-                f"{semi_text}\n\n"
-                f"⛔ <b>{champion.get('fighter_name')}</b> занесён в банлист!\n\n"
+                f"{third_text}\n\n"
+                f"⛔ В банлист: <b>{', '.join(ban_names)}</b>\n\n"
                 "Используйте /leaderboard чтобы посмотреть таблицу лидеров."
             )
 
@@ -5285,16 +5480,9 @@ class TelegramWhisperBot:
                 await update.message.reply_text("❌ Не удалось загрузить сетку.")
                 return
 
-            has_remaining = any(
-                not m["processed"]
-                for rnd in bracket["rounds"]
-                for m in rnd["matches"]
-                if m["player1"].get("fighter_name") != "TBD" and m["player2"].get("fighter_name") != "TBD"
-            )
-
-            if not has_remaining:
-                await update.message.reply_text("ℹ️ Все доступные матчи уже обработаны. Объявляю победителя...")
-                await self.announce_tournament_winner(context, bracket, tournament_id)
+            phase = bracket.get("phase", "swiss")
+            if phase == "completed":
+                await update.message.reply_text("ℹ️ Турнир уже завершён.")
                 return
 
             from datetime import timedelta
