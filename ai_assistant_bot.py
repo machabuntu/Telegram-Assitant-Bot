@@ -5550,7 +5550,7 @@ class TelegramWhisperBot:
             lines = []
             for i, (uid, username, pts, first, second, semi) in enumerate(rows, 1):
                 medal = medals.get(i, f"{i}.")
-                name = f"@{username}" if username else f"id{uid}"
+                name = username if username else f"id{uid}"
                 details = f"({first}🥇 {second}🥈 {semi}🥉)"
                 lines.append(f"{medal} <b>{name}</b> — {pts} очков {details}")
 
