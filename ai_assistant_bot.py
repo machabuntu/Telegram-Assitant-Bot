@@ -80,6 +80,8 @@ class TelegramWhisperBot:
         self.selected_models = self.load_selected_models()
         # Спам-защита для /reg: {user_id: {"count": int, "banned_until": datetime | None}}
         self._reg_spam: dict = {}
+        # Кол-во регистраций при последней ежедневной проверке (для пропуска, если нет новых)
+        self._last_dq_check_count: int = 0
 
     def load_config(self, config_file: str) -> dict:
         """Загружает конфигурацию из JSON файла"""
@@ -4126,6 +4128,7 @@ class TelegramWhisperBot:
     async def open_tournament_registration(self, context):
         """Открывает регистрацию на турнир (каждый понедельник в 13:00 KSK)."""
         try:
+            self._last_dq_check_count = 0
             from datetime import date
             today = date.today()
             # Нормализуем до понедельника текущей недели
@@ -4393,13 +4396,13 @@ class TelegramWhisperBot:
 
     async def validate_participants_with_ai(self, participants: list, bans: list) -> list:
         """Проверяет участников через ИИ: банлист + реальность персонажей.
-        
+
         Args:
             participants: list of dict {user_id, username, fighter_name}
             bans: list of str (забаненные имена)
-        
+
         Returns:
-            list of int (user_id дисквалифицированных)
+            list of (user_id, reason) — дисквалифицированные участники с причинами
         """
         try:
             api_config = self.get_api_config("tournament_api")
@@ -4419,10 +4422,10 @@ class TelegramWhisperBot:
                 "ПРОВЕРКА 2: Все ли заявленные персонажи — реально существующие или существовавшие люди, "
                 "либо широко известные выдуманные персонажи из книг, игр, фильмов, аниме, мифологии и т.д.? "
                 "Если персонаж абсолютно неизвестен или является полной выдумкой без источника — дисквалифицируй.\n\n"
-                "Укажи user_id всех нарушителей. Если нарушений нет — пустой список.\n"
+                "Укажи user_id всех нарушителей и краткую причину для каждого.\n"
                 "В КОНЦЕ ответа обязательно добавь строку в точном формате:\n"
-                "##DISQUALIFIED:user_id1,user_id2##\n"
-                "Если нарушений нет: ##DISQUALIFIED:[]##\n\n"
+                "##DQ:user_id1:причина1|user_id2:причина2##\n"
+                "Если нарушений нет: ##DQ:[]##\n\n"
                 "Перед меткой напиши краткое объяснение своих решений на русском языке."
             )
 
@@ -4434,25 +4437,118 @@ class TelegramWhisperBot:
             response_text, _ = result
             logger.info(f"Ответ ИИ на валидацию: {response_text}")
 
-            match = re.search(r'##DISQUALIFIED:\[([^\]]*)\]##|##DISQUALIFIED:([^#\s]*)##', response_text)
+            match = re.search(r'##DQ:\[([^\]]*)\]##|##DQ:([^#]*)##', response_text)
             if not match:
-                logger.warning("Не удалось найти метку ##DISQUALIFIED## в ответе ИИ")
+                logger.warning("Не удалось найти метку ##DQ## в ответе ИИ")
                 return []
 
             raw = (match.group(1) or match.group(2) or "").strip()
             if not raw:
                 return []
 
-            dq_ids = []
-            for part in raw.split(','):
-                part = part.strip()
-                if part.isdigit():
-                    dq_ids.append(int(part))
-            return dq_ids
+            dq_list = []
+            for entry in raw.split('|'):
+                entry = entry.strip()
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    uid_str = parts[0].strip()
+                    reason = parts[1].strip() if len(parts) > 1 else "Не указана"
+                    if uid_str.isdigit():
+                        dq_list.append((int(uid_str), reason))
+                elif entry.isdigit():
+                    dq_list.append((int(entry), "Не указана"))
+            return dq_list
 
         except Exception as e:
             logger.error(f"Ошибка при валидации участников: {e}", exc_info=True)
             return []
+
+    async def daily_validation_check(self, context):
+        """Ежедневная проверка зарегистрированных участников через ИИ (13:00 KSK)."""
+        try:
+            tournament_id = self._get_current_tournament_id()
+            if not tournament_id:
+                logger.info("Ежедневная проверка: нет активного турнира — пропуск")
+                return
+
+            status = self._get_tournament_status(tournament_id)
+            if status != "registration":
+                logger.info(f"Ежедневная проверка: турнир {tournament_id} не в фазе регистрации ({status}) — пропуск")
+                return
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, username, fighter_name FROM tournament_registrations "
+                "WHERE tournament_id=? AND disqualified=0",
+                (tournament_id,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            current_count = len(rows)
+            if current_count == self._last_dq_check_count:
+                logger.info(f"Ежедневная проверка: нет новых регистраций ({current_count}) — пропуск")
+                return
+
+            participants = [
+                {"user_id": r[0], "username": r[1], "fighter_name": r[2]}
+                for r in rows
+            ]
+
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT fighter_name FROM tournament_bans")
+            bans = [r[0] for r in cursor.fetchall()]
+            conn.close()
+
+            dq_results = await self.validate_participants_with_ai(participants, bans)
+
+            if dq_results:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                dq_lines = []
+                for uid, reason in dq_results:
+                    cursor.execute(
+                        "UPDATE tournament_registrations SET disqualified=1 "
+                        "WHERE tournament_id=? AND user_id=?",
+                        (tournament_id, uid)
+                    )
+                    p = next((p for p in participants if p["user_id"] == uid), None)
+                    if p:
+                        dq_lines.append(f"• @{p['username']} → <b>{p['fighter_name']}</b> — {reason}")
+                        try:
+                            await context.bot.send_message(
+                                chat_id=uid,
+                                text=(
+                                    f"🚫 Ваш боец <b>{p['fighter_name']}</b> дисквалифицирован.\n"
+                                    f"Причина: {reason}\n\n"
+                                    "Вы можете зарегистрировать нового бойца командой /reg"
+                                ),
+                                parse_mode="HTML"
+                            )
+                        except Exception as dm_err:
+                            logger.warning(f"Не удалось отправить ЛС пользователю {uid}: {dm_err}")
+                conn.commit()
+                conn.close()
+
+                channel_id = self.config.get('tournament_channel_id')
+                if channel_id and dq_lines:
+                    await context.bot.send_message(
+                        chat_id=channel_id,
+                        text=(
+                            "🔍 <b>Ежедневная проверка участников:</b>\n\n"
+                            + "\n".join(dq_lines)
+                        ),
+                        parse_mode="HTML"
+                    )
+
+            # Обновляем счётчик после проверки (за вычетом дисквалифицированных)
+            self._last_dq_check_count = current_count - len(dq_results)
+            logger.info(f"Ежедневная проверка завершена: дисквалифицировано {len(dq_results)}, осталось {self._last_dq_check_count}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при ежедневной проверке участников: {e}", exc_info=True)
 
     def build_bracket(self, participants: list) -> dict:
         """Строит швейцарскую турнирную сетку.
@@ -4973,16 +5069,17 @@ class TelegramWhisperBot:
             conn.close()
 
             # Валидация участников через ИИ
-            dq_ids = await self.validate_participants_with_ai(participants, bans)
+            dq_results = await self.validate_participants_with_ai(participants, bans)
 
-            if dq_ids:
-                dq_participants = [p for p in participants if p["user_id"] in dq_ids]
-                valid_participants = [p for p in participants if p["user_id"] not in dq_ids]
+            if dq_results:
+                dq_uid_set = {uid for uid, _ in dq_results}
+                dq_participants = [p for p in participants if p["user_id"] in dq_uid_set]
+                valid_participants = [p for p in participants if p["user_id"] not in dq_uid_set]
 
                 # Помечаем дисквалифицированных в БД
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
-                for uid in dq_ids:
+                for uid, _ in dq_results:
                     cursor.execute(
                         "UPDATE tournament_registrations SET disqualified=1 "
                         "WHERE tournament_id=? AND user_id=?",
@@ -5668,10 +5765,18 @@ class TelegramWhisperBot:
                     time=start_time,
                     days=(start_day,)
                 )
+
+                dq_check_time = _parse_tournament_time(self.config.get("tournament_daily_check_time"))
+                job_queue.run_daily(
+                    self.daily_validation_check,
+                    time=dq_check_time
+                )
+
                 logger.info(
                     f"Турнирное расписание настроено: регистрация {_weekday_labels[reg_day]} в "
                     f"{reg_time.strftime('%H:%M')} KSK, "
-                    f"старт {_weekday_labels[start_day]} в {start_time.strftime('%H:%M')} KSK"
+                    f"старт {_weekday_labels[start_day]} в {start_time.strftime('%H:%M')} KSK, "
+                    f"ежедневная проверка в {dq_check_time.strftime('%H:%M')} KSK"
                 )
             else:
                 logger.warning("JobQueue не доступен. Для периодического обновления моделей установите: pip install 'python-telegram-bot[job-queue]'")
