@@ -4596,37 +4596,43 @@ class TelegramWhisperBot:
                 "is_bye": True
             }
 
-        paired = [False] * len(players)
+        def _backtrack(remaining):
+            """Рекурсивный подбор пар без рематчей.
+
+            remaining — список индексов в players[], отсортированный по очкам.
+            Возвращает список кортежей (i, j) или None если невозможно.
+            """
+            if len(remaining) < 2:
+                return []
+            first = remaining[0]
+            rest = remaining[1:]
+            for pos, second in enumerate(rest):
+                if frozenset([players[first]["user_id"], players[second]["user_id"]]) not in played:
+                    sub = _backtrack(rest[:pos] + rest[pos + 1:])
+                    if sub is not None:
+                        return [(first, second)] + sub
+            return None
+
+        indices = list(range(len(players)))
+        pairs = _backtrack(indices)
+
+        if pairs is None:
+            logger.warning("Не удалось составить пары без рематчей — допускаем рематчи")
+            pairs = [(indices[i], indices[i + 1]) for i in range(0, len(indices) - 1, 2)]
+
         match_num = 1
-        for i in range(len(players)):
-            if paired[i]:
-                continue
-            best_j = None
-            for j in range(i + 1, len(players)):
-                if paired[j]:
-                    continue
-                if frozenset([players[i]["user_id"], players[j]["user_id"]]) not in played:
-                    best_j = j
-                    break
-            if best_j is None:
-                for j in range(i + 1, len(players)):
-                    if not paired[j]:
-                        best_j = j
-                        break
-            if best_j is not None:
-                matches.append({
-                    "match_id": f"{round_number}-{match_num}",
-                    "player1": players[i],
-                    "player2": players[best_j],
-                    "winner_user_id": None,
-                    "winner_fighter": None,
-                    "story": None,
-                    "processed": False,
-                    "is_bye": False
-                })
-                paired[i] = True
-                paired[best_j] = True
-                match_num += 1
+        for i, j in pairs:
+            matches.append({
+                "match_id": f"{round_number}-{match_num}",
+                "player1": players[i],
+                "player2": players[j],
+                "winner_user_id": None,
+                "winner_fighter": None,
+                "story": None,
+                "processed": False,
+                "is_bye": False
+            })
+            match_num += 1
 
         if bye_match:
             matches.append(bye_match)
