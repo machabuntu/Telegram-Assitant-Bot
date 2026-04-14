@@ -4258,15 +4258,34 @@ class TelegramWhisperBot:
             await update.message.reply_text("⚔️ Регистрация на этот турнир уже закрыта.")
             return
 
-        # ── Проверка дубля через ИИ ────────────────────────────────────────────
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        cursor.execute(
+            "SELECT disqualified, fighter_name FROM tournament_registrations "
+            "WHERE tournament_id=? AND user_id=?",
+            (tournament_id, user_id)
+        )
+        existing_own = cursor.fetchone()
+        if existing_own is not None:
+            disqualified_flag = int(existing_own[0] or 0)
+            prev_fighter = existing_own[1]
+            if disqualified_flag == 0:
+                conn.close()
+                await update.message.reply_text(
+                    f"⚠️ Вы уже зарегистрированы на этот турнир с бойцом <b>{prev_fighter}</b>.\n"
+                    "Изменить выбор нельзя.",
+                    parse_mode='HTML'
+                )
+                return
+        re_register = existing_own is not None and int(existing_own[0] or 0) == 1
         cursor.execute(
             "SELECT fighter_name FROM tournament_registrations WHERE tournament_id=? AND disqualified=0",
             (tournament_id,)
         )
         existing_fighters = [row[0] for row in cursor.fetchall()]
         conn.close()
+
+        # ── Проверка дубля через ИИ ────────────────────────────────────────────
 
         if existing_fighters:
             is_taken = await self._check_fighter_duplicate(fighter_name, existing_fighters)
@@ -4293,14 +4312,22 @@ class TelegramWhisperBot:
                     )
                 return
 
+        now_iso = datetime.now().isoformat()
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO tournament_registrations (tournament_id, user_id, username, fighter_name, registered_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (tournament_id, user_id, username, fighter_name, datetime.now().isoformat())
-            )
+            if re_register:
+                cursor.execute(
+                    "UPDATE tournament_registrations SET username=?, fighter_name=?, registered_at=?, disqualified=0 "
+                    "WHERE tournament_id=? AND user_id=?",
+                    (username, fighter_name, now_iso, tournament_id, user_id)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO tournament_registrations (tournament_id, user_id, username, fighter_name, registered_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (tournament_id, user_id, username, fighter_name, now_iso)
+                )
             conn.commit()
             conn.close()
             # Успешная регистрация — сбрасываем счётчик спама
