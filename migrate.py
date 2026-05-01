@@ -66,6 +66,7 @@ TABLES = [
         fighter_name TEXT NOT NULL,
         registered_at TEXT NOT NULL,
         disqualified INTEGER DEFAULT 0,
+        validated INTEGER DEFAULT 0,
         UNIQUE(tournament_id, user_id)
     )
     """,
@@ -121,6 +122,7 @@ COLUMN_MIGRATIONS = {
     ],
     "tournament_registrations": [
         ("disqualified", "INTEGER DEFAULT 0"),
+        ("validated", "INTEGER DEFAULT 0"),
     ],
     "tournaments": [
         ("bracket_json", "TEXT"),

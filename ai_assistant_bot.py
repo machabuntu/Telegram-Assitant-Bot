@@ -80,8 +80,6 @@ class TelegramWhisperBot:
         self.selected_models = self.load_selected_models()
         # Спам-защита для /reg: {user_id: {"count": int, "banned_until": datetime | None}}
         self._reg_spam: dict = {}
-        # Кол-во регистраций при последней ежедневной проверке (для пропуска, если нет новых)
-        self._last_dq_check_count: int = 0
 
     def load_config(self, config_file: str) -> dict:
         """Загружает конфигурацию из JSON файла"""
@@ -189,6 +187,7 @@ class TelegramWhisperBot:
                     fighter_name TEXT NOT NULL,
                     registered_at TEXT NOT NULL,
                     disqualified INTEGER DEFAULT 0,
+                    validated INTEGER DEFAULT 0,
                     UNIQUE(tournament_id, user_id)
                 )
             ''')
@@ -253,6 +252,7 @@ class TelegramWhisperBot:
             ],
             "tournament_registrations": [
                 ("disqualified", "INTEGER DEFAULT 0"),
+                ("validated", "INTEGER DEFAULT 0"),
             ],
             "tournaments": [
                 ("bracket_json",  "TEXT"),
@@ -4128,7 +4128,6 @@ class TelegramWhisperBot:
     async def open_tournament_registration(self, context):
         """Открывает регистрацию на турнир (каждый понедельник в 13:00 KSK)."""
         try:
-            self._last_dq_check_count = 0
             from datetime import date
             today = date.today()
             # Нормализуем до понедельника текущей недели
@@ -4318,7 +4317,7 @@ class TelegramWhisperBot:
             cursor = conn.cursor()
             if re_register:
                 cursor.execute(
-                    "UPDATE tournament_registrations SET username=?, fighter_name=?, registered_at=?, disqualified=0 "
+                    "UPDATE tournament_registrations SET username=?, fighter_name=?, registered_at=?, disqualified=0, validated=0 "
                     "WHERE tournament_id=? AND user_id=?",
                     (username, fighter_name, now_iso, tournament_id, user_id)
                 )
@@ -4491,7 +4490,11 @@ class TelegramWhisperBot:
             return []
 
     async def daily_validation_check(self, context):
-        """Ежедневная проверка зарегистрированных участников через ИИ (13:00 KSK)."""
+        """Ежедневная проверка новых зарегистрированных участников через ИИ (13:00 KSK).
+
+        Проверяются только записи с validated=0 — те, что ещё не проходили проверку.
+        Если новых нет — задача скипается, чтобы не тратить токены.
+        """
         try:
             tournament_id = self._get_current_tournament_id()
             if not tournament_id:
@@ -4507,15 +4510,14 @@ class TelegramWhisperBot:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT user_id, username, fighter_name FROM tournament_registrations "
-                "WHERE tournament_id=? AND disqualified=0",
+                "WHERE tournament_id=? AND disqualified=0 AND validated=0",
                 (tournament_id,)
             )
             rows = cursor.fetchall()
             conn.close()
 
-            current_count = len(rows)
-            if current_count == self._last_dq_check_count:
-                logger.info(f"Ежедневная проверка: нет новых регистраций ({current_count}) — пропуск")
+            if not rows:
+                logger.info("Ежедневная проверка: нет новых непроверенных регистраций — пропуск")
                 return
 
             participants = [
@@ -4531,36 +4533,44 @@ class TelegramWhisperBot:
 
             dq_results = await self.validate_participants_with_ai(participants, bans)
 
-            if dq_results:
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                dq_lines = []
-                for uid, reason in dq_results:
-                    cursor.execute(
-                        "UPDATE tournament_registrations SET disqualified=1 "
-                        "WHERE tournament_id=? AND user_id=?",
-                        (tournament_id, uid)
-                    )
-                    p = next((p for p in participants if p["user_id"] == uid), None)
-                    if p:
-                        dq_lines.append(f"• @{p['username']} → <b>{p['fighter_name']}</b> — {reason}")
-                        try:
-                            await context.bot.send_message(
-                                chat_id=uid,
-                                text=(
-                                    f"🚫 Ваш боец <b>{p['fighter_name']}</b> дисквалифицирован.\n"
-                                    f"Причина: {reason}\n\n"
-                                    "Вы можете зарегистрировать нового бойца командой /reg"
-                                ),
-                                parse_mode="HTML"
-                            )
-                        except Exception as dm_err:
-                            logger.warning(f"Не удалось отправить ЛС пользователю {uid}: {dm_err}")
-                conn.commit()
-                conn.close()
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            dq_lines = []
+            for uid, reason in dq_results:
+                cursor.execute(
+                    "UPDATE tournament_registrations SET disqualified=1 "
+                    "WHERE tournament_id=? AND user_id=?",
+                    (tournament_id, uid)
+                )
+                p = next((p for p in participants if p["user_id"] == uid), None)
+                if p:
+                    dq_lines.append(f"• @{p['username']} → <b>{p['fighter_name']}</b> — {reason}")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=uid,
+                            text=(
+                                f"🚫 Ваш боец <b>{p['fighter_name']}</b> дисквалифицирован.\n"
+                                f"Причина: {reason}\n\n"
+                                "Вы можете зарегистрировать нового бойца командой /reg"
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception as dm_err:
+                        logger.warning(f"Не удалось отправить ЛС пользователю {uid}: {dm_err}")
+            # Помечаем все проверенные регистрации как validated, чтобы повторно не отправлять в ИИ
+            checked_uids = [p["user_id"] for p in participants]
+            placeholders = ",".join("?" for _ in checked_uids)
+            cursor.execute(
+                f"UPDATE tournament_registrations SET validated=1 "
+                f"WHERE tournament_id=? AND user_id IN ({placeholders})",
+                (tournament_id, *checked_uids)
+            )
+            conn.commit()
+            conn.close()
 
+            if dq_lines:
                 channel_id = self.config.get('tournament_channel_id')
-                if channel_id and dq_lines:
+                if channel_id:
                     await context.bot.send_message(
                         chat_id=channel_id,
                         text=(
@@ -4570,9 +4580,7 @@ class TelegramWhisperBot:
                         parse_mode="HTML"
                     )
 
-            # Обновляем счётчик после проверки (за вычетом дисквалифицированных)
-            self._last_dq_check_count = current_count - len(dq_results)
-            logger.info(f"Ежедневная проверка завершена: дисквалифицировано {len(dq_results)}, осталось {self._last_dq_check_count}")
+            logger.info(f"Ежедневная проверка завершена: проверено {len(participants)}, дисквалифицировано {len(dq_results)}")
 
         except Exception as e:
             logger.error(f"Ошибка при ежедневной проверке участников: {e}", exc_info=True)
@@ -4637,13 +4645,21 @@ class TelegramWhisperBot:
     def compute_standings(self, bracket: dict) -> list:
         """Считает очки/победы/поражения каждого участника по раундам швейцарки.
 
-        Тай-брейк-матчи НЕ влияют на очки — они используются только для
-        разрешения ничьих при определении топ-3.
+        Тай-брейк-матчи НЕ влияют на очки/победы — они используются только для
+        вторичной сортировки внутри групп с равными очками, чтобы зрители
+        видели динамику разрешения ничьих после каждого TB-матча.
         """
         stats = {}
         for p in bracket["participants"]:
             uid = p["user_id"]
-            stats[uid] = {"player": dict(p), "points": 0, "wins": 0, "losses": 0, "byes": 0}
+            stats[uid] = {
+                "player": dict(p),
+                "points": 0,
+                "wins": 0,
+                "losses": 0,
+                "byes": 0,
+                "tb_wins": 0,
+            }
 
         all_matches = []
         for rnd in bracket.get("rounds", []):
@@ -4671,7 +4687,14 @@ class TelegramWhisperBot:
                 if loser_uid in stats:
                     stats[loser_uid]["losses"] += 1
 
-        return sorted(stats.values(), key=lambda x: (-x["points"], -x["wins"]))
+        for tb in bracket.get("tiebreaker_matches", []):
+            if not tb.get("processed") or tb.get("is_bye"):
+                continue
+            w = tb.get("winner_user_id")
+            if w and w in stats:
+                stats[w]["tb_wins"] += 1
+
+        return sorted(stats.values(), key=lambda x: (-x["points"], -x["tb_wins"], -x["wins"]))
 
     def generate_swiss_pairings(self, bracket: dict, round_number: int) -> list:
         """Жеребьёвка для очередного раунда швейцарки.
@@ -4813,13 +4836,6 @@ class TelegramWhisperBot:
                 resolved.append(group[0]["player"])
                 continue
 
-            slots_left = 3 - len(resolved)
-
-            if len(group) <= slots_left:
-                for g in group:
-                    resolved.append(g["player"])
-                continue
-
             group_uids = [g["player"]["user_id"] for g in group]
             uid_to_player = {g["player"]["user_id"]: g["player"] for g in group}
 
@@ -4954,7 +4970,6 @@ class TelegramWhisperBot:
                 x += width
 
             y = TITLE_H + HEADER_H
-            medals = {0: "🥇", 1: "🥈", 2: "🥉"}
             for idx, s in enumerate(standings):
                 player = s["player"]
                 if idx == 0:
@@ -4971,7 +4986,7 @@ class TelegramWhisperBot:
                 draw.rectangle([MARGIN, y, MARGIN + TABLE_W, y + ROW_H], fill=bg)
 
                 x = MARGIN
-                rank_text = medals.get(idx, f"{idx + 1}")
+                rank_text = f"{idx + 1}"
                 draw.text((x + 8, y + 9), rank_text, fill=C_TEXT, font=font_bold)
                 x += COL_RANK
 
@@ -5052,7 +5067,7 @@ class TelegramWhisperBot:
                 (tournament_id,)
             )
             cursor.execute(
-                "SELECT user_id, username, fighter_name FROM tournament_registrations "
+                "SELECT user_id, username, fighter_name, validated FROM tournament_registrations "
                 "WHERE tournament_id=? AND disqualified=0",
                 (tournament_id,)
             )
@@ -5061,6 +5076,10 @@ class TelegramWhisperBot:
             conn.close()
 
             participants = [{"user_id": r[0], "username": r[1], "fighter_name": r[2]} for r in rows]
+            unvalidated = [
+                {"user_id": r[0], "username": r[1], "fighter_name": r[2]}
+                for r in rows if not r[3]
+            ]
 
             await context.bot.send_message(
                 chat_id=channel_id,
@@ -5095,15 +5114,11 @@ class TelegramWhisperBot:
             bans = [r[0] for r in cursor.fetchall()]
             conn.close()
 
-            # Валидация участников через ИИ
-            dq_results = await self.validate_participants_with_ai(participants, bans)
+            # Валидация: гоняем через ИИ только тех, кто ещё не был проверен ежедневной задачей
+            dq_results = []
+            if unvalidated:
+                dq_results = await self.validate_participants_with_ai(unvalidated, bans)
 
-            if dq_results:
-                dq_uid_set = {uid for uid, _ in dq_results}
-                dq_participants = [p for p in participants if p["user_id"] in dq_uid_set]
-                valid_participants = [p for p in participants if p["user_id"] not in dq_uid_set]
-
-                # Помечаем дисквалифицированных в БД
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
                 for uid, _ in dq_results:
@@ -5112,8 +5127,22 @@ class TelegramWhisperBot:
                         "WHERE tournament_id=? AND user_id=?",
                         (tournament_id, uid)
                     )
+                checked_uids = [p["user_id"] for p in unvalidated]
+                placeholders = ",".join("?" for _ in checked_uids)
+                cursor.execute(
+                    f"UPDATE tournament_registrations SET validated=1 "
+                    f"WHERE tournament_id=? AND user_id IN ({placeholders})",
+                    (tournament_id, *checked_uids)
+                )
                 conn.commit()
                 conn.close()
+            else:
+                logger.info("Пред-турнирная валидация: все участники уже проверены — пропуск")
+
+            if dq_results:
+                dq_uid_set = {uid for uid, _ in dq_results}
+                dq_participants = [p for p in participants if p["user_id"] in dq_uid_set]
+                valid_participants = [p for p in participants if p["user_id"] not in dq_uid_set]
 
                 dq_lines = "\n".join(
                     f"• @{p['username']} → <b>{p['fighter_name']}</b>" for p in dq_participants
