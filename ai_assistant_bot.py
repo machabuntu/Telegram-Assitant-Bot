@@ -5055,9 +5055,17 @@ class TelegramWhisperBot:
                 logger.info("Нет активного турнира для закрытия.")
                 return
 
-            if self._get_tournament_status(tournament_id) != 'registration':
-                logger.info(f"Турнир {tournament_id} уже не в фазе регистрации.")
+            current_status = self._get_tournament_status(tournament_id)
+            if current_status not in ('registration', 'validation'):
+                logger.info(
+                    f"Турнир {tournament_id} в статусе '{current_status}' — close_and_start пропускается."
+                )
                 return
+            if current_status == 'validation':
+                logger.info(
+                    f"Турнир {tournament_id} застрял в статусе 'validation' — "
+                    "продолжаем закрытие/старт (вызвано вручную или после рестарта)."
+                )
 
             # Закрываем регистрацию
             conn = sqlite3.connect(self.db_path)
@@ -5618,7 +5626,12 @@ class TelegramWhisperBot:
             await update.message.reply_text("❌ Ошибка при получении таблицы лидеров.")
 
     async def resume_tournament_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /resume_tournament — возобновляет зависший турнир, планируя следующий матч."""
+        """Команда /resume_tournament — универсальный «возобновлятор»/ручной старт турнира.
+
+        - status='registration'/'validation' → запускает close_and_start_tournament.
+        - status='active' → планирует следующий матч (process_next_match).
+        - status='completed'/'cancelled' → сообщает, что турнир уже не в работе.
+        """
         if not self.is_authorized_channel(update):
             await update.message.reply_text("Доступ запрещен.")
             return
@@ -5630,28 +5643,44 @@ class TelegramWhisperBot:
                 return
 
             status = self._get_tournament_status(tournament_id)
-            if status != 'active':
-                await update.message.reply_text(f"❌ Турнир {tournament_id} не в активной фазе (статус: {status}).")
-                return
-
-            bracket = self._load_bracket(tournament_id)
-            if not bracket:
-                await update.message.reply_text("❌ Не удалось загрузить сетку.")
-                return
-
-            phase = bracket.get("phase", "swiss")
-            if phase == "completed":
-                await update.message.reply_text("ℹ️ Турнир уже завершён.")
-                return
-
             from datetime import timedelta
-            context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+
+            if status in ('registration', 'validation'):
+                context.job_queue.run_once(self.close_and_start_tournament, when=timedelta(seconds=5))
+                await update.message.reply_text(
+                    f"✅ Турнир <b>{tournament_id}</b>: закрываю регистрацию и запускаю турнир.\n"
+                    "Старт через 5 секунд.",
+                    parse_mode='HTML'
+                )
+                logger.info(
+                    f"Турнир {tournament_id} запущен вручную через /resume_tournament (status={status})"
+                )
+                return
+
+            if status == 'active':
+                bracket = self._load_bracket(tournament_id)
+                if not bracket:
+                    await update.message.reply_text("❌ Не удалось загрузить сетку.")
+                    return
+
+                phase = bracket.get("phase", "swiss")
+                if phase == "completed":
+                    await update.message.reply_text("ℹ️ Турнир уже завершён.")
+                    return
+
+                context.job_queue.run_once(self.process_next_match, when=timedelta(seconds=5))
+                await update.message.reply_text(
+                    f"✅ Турнир <b>{tournament_id}</b> возобновлён!\n"
+                    "Следующий матч начнётся через 5 секунд.",
+                    parse_mode='HTML'
+                )
+                logger.info(f"Турнир {tournament_id} возобновлён вручную через /resume_tournament")
+                return
+
             await update.message.reply_text(
-                f"✅ Турнир <b>{tournament_id}</b> возобновлён!\n"
-                "Следующий матч начнётся через 5 секунд.",
+                f"ℹ️ Турнир <b>{tournament_id}</b> уже в финальном статусе ({status}).",
                 parse_mode='HTML'
             )
-            logger.info(f"Турнир {tournament_id} возобновлён вручную через /resume_tournament")
 
         except Exception as e:
             logger.error(f"Ошибка при возобновлении турнира: {e}", exc_info=True)
@@ -5811,21 +5840,28 @@ class TelegramWhisperBot:
                 start_time = _parse_tournament_time(self.config.get("tournament_start_time"))
                 start_day  = _parse_tournament_day(self.config.get("tournament_start_day"), 0)          # Sun=0
 
+                # misfire_grace_time + coalesce защищают турнирные джобы от пропусков,
+                # если предыдущая задача (например, AI-валидация) задержала запуск.
+                tournament_job_kwargs = {"misfire_grace_time": 3600, "coalesce": True}
+
                 job_queue.run_daily(
                     self.open_tournament_registration,
                     time=reg_time,
-                    days=(reg_day,)
+                    days=(reg_day,),
+                    job_kwargs=tournament_job_kwargs
                 )
                 job_queue.run_daily(
                     self.close_and_start_tournament,
                     time=start_time,
-                    days=(start_day,)
+                    days=(start_day,),
+                    job_kwargs=tournament_job_kwargs
                 )
 
                 dq_check_time = _parse_tournament_time(self.config.get("tournament_daily_check_time"))
                 job_queue.run_daily(
                     self.daily_validation_check,
-                    time=dq_check_time
+                    time=dq_check_time,
+                    job_kwargs=tournament_job_kwargs
                 )
 
                 logger.info(
