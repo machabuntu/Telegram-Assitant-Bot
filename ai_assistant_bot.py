@@ -223,6 +223,15 @@ class TelegramWhisperBot:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS steam_games (
+                    appid INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    last_modified INTEGER,
+                    updated_at TEXT
+                )
+            ''')
+
             self._migrate_columns(conn)
             conn.commit()
             conn.close()
@@ -365,7 +374,128 @@ class TelegramWhisperBot:
         """Периодически обновляет список моделей (вызывается job_queue)"""
         logger.info("Периодическое обновление списка моделей...")
         self.fetch_openrouter_models()
-    
+
+    def fetch_steam_games(self) -> int:
+        """Загружает полный список игр Steam через IStoreService/GetAppList и атомарно перезаписывает таблицу steam_games.
+
+        Returns:
+            int: количество загруженных игр (0, если произошла ошибка — старые данные в БД при этом не трогаются).
+        """
+        try:
+            steam_cfg = self.config.get("steam_api") or {}
+            api_key = steam_cfg.get("key")
+            url = steam_cfg.get("url", "https://api.steampowered.com/IStoreService/GetAppList/v1/")
+            max_results = int(steam_cfg.get("max_results_per_page", 50000))
+
+            if not api_key:
+                logger.error("steam_api.key не задан в config.json — пропускаю загрузку списка игр Steam")
+                return 0
+
+            base_params = {
+                "key": api_key,
+                "include_games": "true",
+                "include_dlc": "false",
+                "include_software": "false",
+                "include_videos": "false",
+                "include_hardware": "false",
+                "max_results": max_results,
+            }
+
+            collected: dict = {}
+            last_appid: Optional[int] = None
+            max_iterations = 50
+
+            logger.info("Загружаю список игр Steam через IStoreService/GetAppList...")
+
+            for iteration in range(max_iterations):
+                params = dict(base_params)
+                if last_appid is not None:
+                    params["last_appid"] = last_appid
+
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                payload = response.json() or {}
+                resp = payload.get("response") or {}
+                apps = resp.get("apps") or []
+
+                for app in apps:
+                    try:
+                        appid = int(app.get("appid"))
+                    except (TypeError, ValueError):
+                        continue
+                    name = app.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    last_modified = app.get("last_modified")
+                    try:
+                        last_modified_int = int(last_modified) if last_modified is not None else None
+                    except (TypeError, ValueError):
+                        last_modified_int = None
+                    collected[appid] = (appid, name.strip(), last_modified_int)
+
+                have_more = bool(resp.get("have_more_results"))
+                next_cursor = resp.get("last_appid")
+
+                logger.info(
+                    f"Steam GetAppList: страница {iteration + 1}, получено {len(apps)} записей, "
+                    f"всего уникальных {len(collected)}, have_more_results={have_more}"
+                )
+
+                if not have_more or not apps:
+                    break
+
+                if next_cursor is None:
+                    logger.warning("Steam GetAppList: have_more_results=true, но last_appid отсутствует — прерываю пагинацию")
+                    break
+
+                try:
+                    last_appid = int(next_cursor)
+                except (TypeError, ValueError):
+                    logger.warning(f"Steam GetAppList: некорректный last_appid={next_cursor!r}, прерываю пагинацию")
+                    break
+            else:
+                logger.warning(f"Steam GetAppList: достигнут лимит итераций пагинации ({max_iterations}), пишу что есть")
+
+            if not collected:
+                logger.warning("Steam GetAppList: получен пустой список игр — таблицу не трогаю")
+                return 0
+
+            current_time = datetime.now().isoformat()
+            rows = [(appid, name, last_mod, current_time) for appid, name, last_mod in collected.values()]
+
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN")
+                cursor.execute("DELETE FROM steam_games")
+                cursor.executemany(
+                    "INSERT INTO steam_games (appid, name, last_modified, updated_at) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            logger.info(f"Список игр Steam успешно обновлён в БД: {len(rows)} записей")
+            return len(rows)
+
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке списка игр Steam: {e}", exc_info=True)
+            return 0
+
+    async def update_steam_games_periodically(self, context: ContextTypes.DEFAULT_TYPE):
+        """Периодически обновляет список игр Steam в БД (вызывается job_queue).
+
+        Тяжёлая сетевая/БД работа выполняется в executor, чтобы не блокировать event loop бота.
+        """
+        logger.info("Запускаю обновление списка игр Steam...")
+        try:
+            loop = asyncio.get_running_loop()
+            count = await loop.run_in_executor(None, self.fetch_steam_games)
+            logger.info(f"Обновление списка игр Steam завершено: {count} записей")
+        except Exception as e:
+            logger.error(f"Ошибка в фоновой задаче обновления Steam: {e}", exc_info=True)
+
     async def track_generation_cost(self, generation_id: str, user_id: int, username: str, 
                                      first_name: str, last_name: str, command: str):
         """Отслеживает стоимость генерации и обновляет статистику пользователя
@@ -618,6 +748,8 @@ class TelegramWhisperBot:
             "• `/changelast <текст>` - изменение последнего сгенерированного изображения\n\n"
             "🔀 **Объединение изображений:**\n"
             "• `/mergeimage <текст>` - обработка нескольких изображений из последнего сообщения\n\n"
+            "🎮 **Steam:**\n"
+            "• `/randomsteamgame` - ссылка на случайную игру из Steam\n\n"
             "💰 **Баланс и статистика:**\n"
             "• `/balance` - проверка остатка средств на OpenRouter\n"
             "• `/statistics` - статистика расходов пользователей\n\n"
@@ -2056,7 +2188,42 @@ class TelegramWhisperBot:
             await update.message.reply_text(
                 f"❌ Произошла ошибка при перезагрузке: {str(e)}"
             )
-    
+
+    async def randomsteamgame_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /randomsteamgame — отправляет ссылку на случайную игру Steam из БД."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT appid, name FROM steam_games ORDER BY RANDOM() LIMIT 1")
+                row = cursor.fetchone()
+            finally:
+                conn.close()
+
+            if not row:
+                await update.message.reply_text(
+                    "⏳ Список игр Steam ещё загружается, попробуйте через минуту."
+                )
+                return
+
+            appid, name = row
+            store_url = f"https://store.steampowered.com/app/{appid}/"
+            await update.message.reply_text(
+                f"🎲 <b>{name}</b>\n{store_url}",
+                parse_mode='HTML'
+            )
+            logger.info(f"/randomsteamgame: выдана игра appid={appid}, name={name!r}")
+
+        except Exception as e:
+            logger.error(f"Ошибка в команде /randomsteamgame: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ Произошла ошибка при выборе случайной игры: {str(e)}"
+            )
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
         # Сохраняем изображения для последующего использования
@@ -4395,7 +4562,7 @@ class TelegramWhisperBot:
 
             url = api_config.get("url", "https://openrouter.ai/api/v1/chat/completions")
             key = api_config.get("key", "")
-            model = api_config.get("model", "mistralai/mistral-small-2503")
+            model = api_config.get("model", "google/gemini-3-flash-preview")
 
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             data = {
@@ -5731,6 +5898,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("balance", self.balance_command))
         self.application.add_handler(CommandHandler("statistics", self.statistics_command))
         self.application.add_handler(CommandHandler("reload", self.reload_command))
+        self.application.add_handler(CommandHandler("randomsteamgame", self.randomsteamgame_command))
         # Турнирные команды
         self.application.add_handler(CommandHandler("reg", self.reg_command))
         self.application.add_handler(CommandHandler("reglist", self.reglist_command))
@@ -5823,9 +5991,17 @@ class TelegramWhisperBot:
                 )
                 logger.info("Периодическое обновление моделей настроено (каждые 6 часов)")
 
+                # Steam: стартовая загрузка (в фоне, не блокирует запуск) + ежедневное обновление в 00:00 локального времени
+                from datetime import time as dtime
+                job_queue.run_once(self.update_steam_games_periodically, when=0)
+                job_queue.run_daily(
+                    self.update_steam_games_periodically,
+                    time=dtime(0, 0, 0)
+                )
+                logger.info("Обновление списка игр Steam настроено: стартовая загрузка + ежедневно в 00:00 локального времени")
+
                 # Турнирные расписания (Красноярское время UTC+7)
                 import pytz
-                from datetime import time as dtime
                 ksk = pytz.timezone('Asia/Krasnoyarsk')
 
                 # PTB v20+ run_daily uses CRON weekday numbering: 0=Sun, 1=Mon, …, 6=Sat
