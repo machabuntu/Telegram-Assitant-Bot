@@ -232,6 +232,24 @@ class TelegramWhisperBot:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS steam_user_wishlist (
+                    steamid TEXT NOT NULL,
+                    appid INTEGER NOT NULL,
+                    updated_at TEXT,
+                    PRIMARY KEY (steamid, appid)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS steam_user_owned (
+                    steamid TEXT NOT NULL,
+                    appid INTEGER NOT NULL,
+                    updated_at TEXT,
+                    PRIMARY KEY (steamid, appid)
+                )
+            ''')
+
             self._migrate_columns(conn)
             conn.commit()
             conn.close()
@@ -483,6 +501,115 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при загрузке списка игр Steam: {e}", exc_info=True)
             return 0
 
+    def _fetch_steam_wishlist_appids(self, steamid: str) -> Optional[list]:
+        """Получает appid из вишлиста пользователя через IWishlistService/GetWishlist.
+
+        Returns:
+            Список appid, либо None если запрос упал — чтобы вызвавший знал, что данные трогать нельзя.
+        """
+        try:
+            url = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/"
+            response = requests.get(url, params={"steamid": steamid}, timeout=30)
+            response.raise_for_status()
+            payload = response.json() or {}
+            items = (payload.get("response") or {}).get("items") or []
+            appids = []
+            for item in items:
+                try:
+                    appids.append(int(item.get("appid")))
+                except (TypeError, ValueError):
+                    continue
+            return appids
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке вишлиста Steam (steamid={steamid}): {e}", exc_info=True)
+            return None
+
+    def _fetch_steam_owned_appids(self, steamid: str, api_key: str) -> Optional[list]:
+        """Получает appid купленных игр через IPlayerService/GetOwnedGames.
+
+        Returns:
+            Список appid, либо None если запрос упал.
+        """
+        try:
+            url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
+            params = {
+                "key": api_key,
+                "steamid": steamid,
+                "include_appinfo": "false",
+                "include_played_free_games": "true",
+            }
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            payload = response.json() or {}
+            games = (payload.get("response") or {}).get("games") or []
+            appids = []
+            for g in games:
+                try:
+                    appids.append(int(g.get("appid")))
+                except (TypeError, ValueError):
+                    continue
+            return appids
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке купленных игр Steam (steamid={steamid}): {e}", exc_info=True)
+            return None
+
+    def _replace_user_appids(self, table: str, steamid: str, appids: list) -> int:
+        """Атомарно перезаписывает строки таблицы для конкретного steamid.
+
+        Returns:
+            Количество вставленных строк.
+        """
+        now = datetime.now().isoformat()
+        # Дедупликация на случай дублей в ответе API
+        unique_appids = sorted(set(int(a) for a in appids))
+        rows = [(steamid, appid, now) for appid in unique_appids]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            cursor.execute(f"DELETE FROM {table} WHERE steamid=?", (steamid,))
+            if rows:
+                cursor.executemany(
+                    f"INSERT INTO {table} (steamid, appid, updated_at) VALUES (?, ?, ?)",
+                    rows,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return len(rows)
+
+    def fetch_steam_user_lists(self, steamid: str) -> tuple:
+        """Обновляет вишлист и список купленных игр пользователя в БД.
+
+        Каждый список загружается и записывается независимо: если один из API-запросов
+        провалился — другой всё равно применяется. Возвращает (wishlist_count, owned_count);
+        -1 для тех списков, где запрос не удался (данные в БД не трогаются).
+        """
+        try:
+            steam_cfg = self.config.get("steam_api") or {}
+            api_key = steam_cfg.get("key")
+            if not api_key:
+                logger.error("steam_api.key не задан — пропускаю загрузку списков пользователя Steam")
+                return (-1, -1)
+
+            wishlist_count = -1
+            owned_count = -1
+
+            wishlist_ids = self._fetch_steam_wishlist_appids(steamid)
+            if wishlist_ids is not None:
+                wishlist_count = self._replace_user_appids("steam_user_wishlist", steamid, wishlist_ids)
+                logger.info(f"Вишлист Steam (steamid={steamid}) обновлён: {wishlist_count} записей")
+
+            owned_ids = self._fetch_steam_owned_appids(steamid, api_key)
+            if owned_ids is not None:
+                owned_count = self._replace_user_appids("steam_user_owned", steamid, owned_ids)
+                logger.info(f"Купленные игры Steam (steamid={steamid}) обновлены: {owned_count} записей")
+
+            return (wishlist_count, owned_count)
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении списков пользователя Steam (steamid={steamid}): {e}", exc_info=True)
+            return (-1, -1)
+
     async def update_steam_games_periodically(self, context: ContextTypes.DEFAULT_TYPE):
         """Периодически обновляет список игр Steam в БД (вызывается job_queue).
 
@@ -493,6 +620,11 @@ class TelegramWhisperBot:
             loop = asyncio.get_running_loop()
             count = await loop.run_in_executor(None, self.fetch_steam_games)
             logger.info(f"Обновление списка игр Steam завершено: {count} записей")
+
+            oleg = (self.config.get("oleg") or "").strip() if isinstance(self.config.get("oleg"), str) else str(self.config.get("oleg") or "").strip()
+            if oleg:
+                w, o = await loop.run_in_executor(None, self.fetch_steam_user_lists, oleg)
+                logger.info(f"Обновлены списки Олега ({oleg}): вишлист={w}, куплено={o}")
         except Exception as e:
             logger.error(f"Ошибка в фоновой задаче обновления Steam: {e}", exc_info=True)
 
@@ -2190,17 +2322,48 @@ class TelegramWhisperBot:
             )
 
     async def randomsteamgame_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /randomsteamgame — отправляет ссылку на случайную игру Steam из БД."""
+        """Обработчик команды /randomsteamgame — отправляет ссылку на случайную игру Steam из БД.
+
+        Если в конфиге задано поле "oleg" (SteamID64) и для этого пользователя уже загружены
+        вишлист/купленные игры — в сообщение добавляются строки про статус игры у Олега.
+        """
         if not self.is_authorized_channel(update):
             await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
             return
 
         try:
+            oleg_raw = self.config.get("oleg")
+            oleg = str(oleg_raw).strip() if oleg_raw is not None else ""
+
+            extra_lines: list = []
             conn = sqlite3.connect(self.db_path)
             try:
                 cursor = conn.cursor()
                 cursor.execute("SELECT appid, name FROM steam_games ORDER BY RANDOM() LIMIT 1")
                 row = cursor.fetchone()
+
+                if row and oleg:
+                    appid_for_lookup = row[0]
+                    cursor.execute(
+                        "SELECT EXISTS(SELECT 1 FROM steam_user_wishlist WHERE steamid=?), "
+                        "EXISTS(SELECT 1 FROM steam_user_owned WHERE steamid=?)",
+                        (oleg, oleg),
+                    )
+                    has_wishlist_data, has_owned_data = cursor.fetchone()
+
+                    if has_wishlist_data or has_owned_data:
+                        cursor.execute(
+                            "SELECT 1 FROM steam_user_wishlist WHERE steamid=? AND appid=? LIMIT 1",
+                            (oleg, appid_for_lookup),
+                        )
+                        in_wishlist = cursor.fetchone() is not None
+                        cursor.execute(
+                            "SELECT 1 FROM steam_user_owned WHERE steamid=? AND appid=? LIMIT 1",
+                            (oleg, appid_for_lookup),
+                        )
+                        is_owned = cursor.fetchone() is not None
+                        extra_lines.append(f"В вишлисте у Олега: {'да' if in_wishlist else 'нет'}")
+                        extra_lines.append(f"Куплено Олегом: {'да' if is_owned else 'нет'}")
             finally:
                 conn.close()
 
@@ -2212,11 +2375,14 @@ class TelegramWhisperBot:
 
             appid, name = row
             store_url = f"https://store.steampowered.com/app/{appid}/"
-            await update.message.reply_text(
-                f"🎲 <b>{name}</b>\n{store_url}",
-                parse_mode='HTML'
+            text = f"🎲 <b>{name}</b>\n{store_url}"
+            if extra_lines:
+                text += "\n\n" + "\n".join(extra_lines)
+            await update.message.reply_text(text, parse_mode='HTML')
+            logger.info(
+                f"/randomsteamgame: выдана игра appid={appid}, name={name!r}, "
+                f"oleg_extras={extra_lines if extra_lines else '—'}"
             )
-            logger.info(f"/randomsteamgame: выдана игра appid={appid}, name={name!r}")
 
         except Exception as e:
             logger.error(f"Ошибка в команде /randomsteamgame: {e}", exc_info=True)
