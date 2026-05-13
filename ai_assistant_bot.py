@@ -4395,7 +4395,7 @@ class TelegramWhisperBot:
 
             url = api_config.get("url", "https://openrouter.ai/api/v1/chat/completions")
             key = api_config.get("key", "")
-            model = api_config.get("model", "mistralai/mistral-small-2503")
+            model = api_config.get("model", "google/gemini-3-flash-preview")
 
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             data = {
