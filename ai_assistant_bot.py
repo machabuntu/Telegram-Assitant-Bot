@@ -2412,10 +2412,10 @@ class TelegramWhisperBot:
 
     # ============================ Викторина (/quiz) ============================
 
-    QUIZ_HINT1_DELAY = 10
-    QUIZ_HINT2_DELAY = 10
-    QUIZ_TIMEOUT_DELAY = 10
-    QUIZ_INTER_QUESTION_DELAY = 3
+    QUIZ_HINT1_DELAY = 15
+    QUIZ_HINT2_DELAY = 15
+    QUIZ_TIMEOUT_DELAY = 15
+    QUIZ_INTER_QUESTION_DELAY = 5
     QUIZ_COUNTDOWN_SECONDS = 10
 
     def _quiz_normalize(self, s) -> str:
