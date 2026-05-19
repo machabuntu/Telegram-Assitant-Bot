@@ -80,6 +80,9 @@ class TelegramWhisperBot:
         self.selected_models = self.load_selected_models()
         # Спам-защита для /reg: {user_id: {"count": int, "banned_until": datetime | None}}
         self._reg_spam: dict = {}
+        # Активные викторины {chat_id: state_dict}. См. quiz_command для структуры состояния.
+        # Состояние в памяти: при перезапуске бота активные викторины прерываются — это приемлемо.
+        self.active_quizzes: dict = {}
 
     def load_config(self, config_file: str) -> dict:
         """Загружает конфигурацию из JSON файла"""
@@ -247,6 +250,19 @@ class TelegramWhisperBot:
                     appid INTEGER NOT NULL,
                     updated_at TEXT,
                     PRIMARY KEY (steamid, appid)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS quiz_scores (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    total_points INTEGER DEFAULT 0,
+                    correct_answers INTEGER DEFAULT 0,
+                    quizzes_played INTEGER DEFAULT 0,
+                    last_played_at TEXT
                 )
             ''')
 
@@ -882,6 +898,10 @@ class TelegramWhisperBot:
             "• `/mergeimage <текст>` - обработка нескольких изображений из последнего сообщения\n\n"
             "🎮 **Steam:**\n"
             "• `/randomsteamgame` - ссылка на случайную игру из Steam\n\n"
+            "🧠 **Викторина:**\n"
+            "• `/quiz <тема>` - запустить викторину на 10 вопросов\n"
+            "• `/quizstop` - остановить текущую викторину\n"
+            "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
             "💰 **Баланс и статистика:**\n"
             "• `/balance` - проверка остатка средств на OpenRouter\n"
             "• `/statistics` - статистика расходов пользователей\n\n"
@@ -2390,6 +2410,722 @@ class TelegramWhisperBot:
                 f"❌ Произошла ошибка при выборе случайной игры: {str(e)}"
             )
 
+    # ============================ Викторина (/quiz) ============================
+
+    QUIZ_HINT1_DELAY = 10
+    QUIZ_HINT2_DELAY = 10
+    QUIZ_TIMEOUT_DELAY = 10
+    QUIZ_INTER_QUESTION_DELAY = 3
+    QUIZ_COUNTDOWN_SECONDS = 10
+
+    def _quiz_normalize(self, s) -> str:
+        """Нормализация ответа для нестрогого сравнения: lower, ё=е, без пунктуации, схлопнутые пробелы."""
+        if not isinstance(s, str):
+            return ""
+        s = s.strip().lower()
+        s = s.replace('ё', 'е')
+        s = re.sub(r'[^\w\s]', ' ', s, flags=re.UNICODE)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
+    def _quiz_strip_json_markdown(self, raw: str) -> str:
+        """Срезает обрамления вида ```json ... ``` если модель их добавила."""
+        if not isinstance(raw, str):
+            return ""
+        s = raw.strip()
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+            if s.endswith("```"):
+                s = s[:-3]
+            s = s.strip()
+        return s
+
+    def _quiz_validate_questions(self, data) -> Optional[dict]:
+        """Проверяет, что в распарсенном JSON ровно 10 валидных вопросов; возвращает нормализованный dict или None."""
+        if not isinstance(data, dict):
+            return None
+        questions = data.get("questions")
+        if not isinstance(questions, list) or len(questions) != 10:
+            logger.warning(f"Quiz JSON: ожидалось 10 вопросов, получено {len(questions) if isinstance(questions, list) else 'не список'}")
+            return None
+        validated = []
+        for i, q in enumerate(questions):
+            if not isinstance(q, dict):
+                logger.warning(f"Quiz JSON: вопрос {i} не является объектом")
+                return None
+            question = q.get("question")
+            answers = q.get("answers")
+            hints = q.get("hints")
+            if not isinstance(question, str) or not question.strip():
+                logger.warning(f"Quiz JSON: пустой/некорректный question у вопроса {i}")
+                return None
+            if not isinstance(answers, list) or not answers:
+                logger.warning(f"Quiz JSON: пустой/некорректный answers у вопроса {i}")
+                return None
+            answers_clean = []
+            for a in answers:
+                if isinstance(a, str) and a.strip():
+                    answers_clean.append(a.strip())
+            if not answers_clean:
+                logger.warning(f"Quiz JSON: ни одного валидного варианта ответа у вопроса {i}")
+                return None
+            if not isinstance(hints, list) or len(hints) != 2:
+                logger.warning(f"Quiz JSON: ожидалось 2 подсказки у вопроса {i}, получено {len(hints) if isinstance(hints, list) else 'не список'}")
+                return None
+            hints_clean = []
+            for h in hints:
+                if isinstance(h, str) and h.strip():
+                    hints_clean.append(h.strip())
+                else:
+                    logger.warning(f"Quiz JSON: пустая/некорректная подсказка у вопроса {i}")
+                    return None
+            if len(hints_clean) != 2:
+                return None
+            validated.append({
+                "question": question.strip(),
+                "answers": answers_clean,
+                "hints": hints_clean,
+            })
+        topic = data.get("topic")
+        return {
+            "topic": topic.strip() if isinstance(topic, str) and topic.strip() else "",
+            "questions": validated,
+        }
+
+    async def _quiz_send_openrouter_request(self, prompt: str, api_config: dict) -> Optional[tuple]:
+        """Отдельный вызов OpenRouter с response_format=json_object для гарантированного JSON."""
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_config['key']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": api_config["model"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            }
+            logger.info(f"Отправляю quiz-запрос в OpenRouter (модель: {api_config['model']})")
+            response = requests.post(api_config["url"], headers=headers, json=data, timeout=300)
+            if response.status_code != 200:
+                logger.error(f"Quiz OpenRouter error: {response.status_code} - {self._truncate_http_error_body(response.text)}")
+                return None
+            try:
+                result = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Quiz: не удалось распарсить ответ OpenRouter как JSON: {e}")
+                return None
+            logger.info(f"Ответ OpenRouter (quiz): {self._format_api_result_for_log(result)}")
+            try:
+                text = result['choices'][0]['message']['content']
+            except (KeyError, IndexError) as e:
+                logger.error(f"Quiz: неожиданная структура ответа OpenRouter: {e}")
+                return None
+            generation_id = self.get_generation_id_from_response(result)
+            return (text, generation_id)
+        except Exception as e:
+            logger.error(f"Quiz: ошибка при отправке запроса в OpenRouter: {e}", exc_info=True)
+            return None
+
+    async def _generate_quiz_with_llm(self, topic: str, user) -> Optional[dict]:
+        """Генерирует викторину на тему через OpenRouter (gemini-3.1-pro-preview).
+
+        Делает одну повторную попытку при невалидном JSON. Возвращает dict {topic, questions:[...]} или None.
+        Стоимость генерации трекаем через track_generation_cost.
+        """
+        api_config = self.get_api_config("quiz_api")
+
+        prompt = (
+            f'Сгенерируй викторину на тему "{topic}".\n\n'
+            "Требования:\n"
+            "- РОВНО 10 вопросов.\n"
+            "- Для каждого вопроса: основной правильный ответ + список альтернативных формулировок "
+            "(русское и английское написание, общеупотребимые синонимы, прозвища, распространённые сокращения). "
+            "От 1 до 8 вариантов в списке.\n"
+            "- Не давай вариантов ответа в самом вопросе.\n"
+            "- Для каждого вопроса РОВНО 2 подсказки на русском: hint_1 — менее очевидная, hint_2 — более очевидная.\n"
+            "- Не используй пункт- и numbering-маркеры внутри полей.\n\n"
+            "Верни ТОЛЬКО валидный JSON без markdown-обёрток:\n"
+            "{\n"
+            '  "topic": "тема",\n'
+            '  "questions": [\n'
+            "    {\n"
+            '      "question": "...",\n'
+            '      "answers": ["основной ответ", "альтернатива 1", "..."],\n'
+            '      "hints": ["менее очевидная подсказка", "более очевидная подсказка"]\n'
+            "    }\n"
+            "    // ... ещё 9 объектов\n"
+            "  ]\n"
+            "}"
+        )
+
+        for attempt in (1, 2):
+            result = await self._quiz_send_openrouter_request(prompt, api_config)
+            if not result:
+                logger.warning(f"Quiz: попытка {attempt} — пустой ответ от модели")
+                continue
+            text, generation_id = result
+            if generation_id and user is not None:
+                try:
+                    await self.track_generation_cost(
+                        generation_id,
+                        user.id,
+                        user.username or "",
+                        user.first_name or "",
+                        user.last_name or "",
+                        "quiz",
+                    )
+                except Exception as e:
+                    logger.warning(f"Quiz: не удалось затрекать стоимость: {e}")
+            cleaned = self._quiz_strip_json_markdown(text)
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Quiz: попытка {attempt} — невалидный JSON: {e}; сырой текст: {self._single_line_log_preview(cleaned, 500)}")
+                continue
+            validated = self._quiz_validate_questions(parsed)
+            if validated is None:
+                logger.warning(f"Quiz: попытка {attempt} — JSON не прошёл валидацию")
+                continue
+            if not validated.get("topic"):
+                validated["topic"] = topic
+            logger.info(f"Quiz: успешно сгенерировано 10 вопросов на тему {topic!r} (попытка {attempt})")
+            return validated
+
+        return None
+
+    def _quiz_cancel_jobs(self, state: dict):
+        """Снимает все запланированные джобы текущего вопроса."""
+        for job in state.get("jobs", []) or []:
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
+        state["jobs"] = []
+
+    def _quiz_display_name(self, info: dict) -> str:
+        """Имя для лидерборда: first_name [last_name], либо username, либо id."""
+        first = (info.get("first_name") or "").strip()
+        last = (info.get("last_name") or "").strip()
+        if first and last:
+            return f"{first} {last}"
+        if first:
+            return first
+        username = (info.get("username") or "").strip()
+        if username:
+            return username
+        return f"id{info.get('user_id', '?')}"
+
+    def _quiz_award_points(self, state: dict, user, points: int):
+        """Начисляет очки игроку в рамках текущей сессии."""
+        user_id = user.id
+        rec = state["scores"].get(user_id)
+        if not rec:
+            rec = {
+                "user_id": user_id,
+                "username": user.username or "",
+                "first_name": user.first_name or "",
+                "last_name": user.last_name or "",
+                "points": 0,
+                "correct": 0,
+            }
+            state["scores"][user_id] = rec
+        else:
+            rec["username"] = user.username or rec.get("username", "")
+            rec["first_name"] = user.first_name or rec.get("first_name", "")
+            rec["last_name"] = user.last_name or rec.get("last_name", "")
+        rec["points"] += points
+        rec["correct"] += 1
+
+    def _quiz_persist_scores(self, state: dict):
+        """Сохраняет накопленные за сессию очки в глобальную таблицу quiz_scores."""
+        if not state.get("scores"):
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                now = datetime.now().isoformat()
+                for user_id, s in state["scores"].items():
+                    if s.get("correct", 0) <= 0 and s.get("points", 0) <= 0:
+                        continue
+                    cursor.execute("SELECT 1 FROM quiz_scores WHERE user_id=?", (user_id,))
+                    exists = cursor.fetchone() is not None
+                    if exists:
+                        cursor.execute(
+                            """
+                            UPDATE quiz_scores
+                            SET username=?, first_name=?, last_name=?,
+                                total_points = total_points + ?,
+                                correct_answers = correct_answers + ?,
+                                quizzes_played = quizzes_played + 1,
+                                last_played_at=?
+                            WHERE user_id=?
+                            """,
+                            (
+                                s.get("username", ""), s.get("first_name", ""), s.get("last_name", ""),
+                                int(s.get("points", 0)), int(s.get("correct", 0)),
+                                now, user_id,
+                            ),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO quiz_scores
+                            (user_id, username, first_name, last_name,
+                             total_points, correct_answers, quizzes_played, last_played_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                            """,
+                            (
+                                user_id,
+                                s.get("username", ""), s.get("first_name", ""), s.get("last_name", ""),
+                                int(s.get("points", 0)), int(s.get("correct", 0)),
+                                now,
+                            ),
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Quiz: ошибка при сохранении очков в БД: {e}", exc_info=True)
+
+    async def _quiz_check_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Проверяет, является ли сообщение в чате правильным ответом на текущий вопрос.
+
+        Возвращает True, если ответ засчитан (правильный) — чтобы вызывающий handle_message прекратил дальнейшую обработку.
+        """
+        try:
+            chat = update.effective_chat
+            if not chat:
+                return False
+            chat_id = chat.id
+            state = self.active_quizzes.get(chat_id)
+            if not state:
+                return False
+            if not state.get("awaiting_answer"):
+                return False
+            text = update.message.text
+            if not isinstance(text, str) or not text.strip():
+                return False
+            if len(text) > 200:
+                return False
+
+            current_index = state["current_index"]
+            if current_index >= len(state["questions"]):
+                return False
+            q = state["questions"][current_index]
+            answers = q.get("answers") or []
+
+            normalized_text = self._quiz_normalize(text)
+            if not normalized_text:
+                return False
+            normalized_answers = {self._quiz_normalize(a) for a in answers if isinstance(a, str)}
+            if normalized_text not in normalized_answers:
+                return False
+
+            captured_index = current_index
+            state["awaiting_answer"] = False
+            self._quiz_cancel_jobs(state)
+
+            hints_shown = state.get("current_hints", 0)
+            points = 3 if hints_shown == 0 else (2 if hints_shown == 1 else 1)
+            user = update.effective_user
+            self._quiz_award_points(state, user, points)
+
+            display = self._quiz_display_name({
+                "user_id": user.id,
+                "username": user.username or "",
+                "first_name": user.first_name or "",
+                "last_name": user.last_name or "",
+            })
+            main_answer = answers[0] if answers else "?"
+            try:
+                await update.message.reply_text(
+                    f"✅ <b>{display}</b> ответил(а) правильно! +{points} оч.\n"
+                    f"Правильный ответ: <b>{main_answer}</b>",
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.warning(f"Quiz: не удалось ответить на правильный ответ: {e}")
+
+            logger.info(
+                f"Quiz chat={chat_id}: правильный ответ от user_id={user.id} на вопрос {captured_index + 1}, "
+                f"подсказок={hints_shown}, очков={points}"
+            )
+
+            try:
+                job = context.job_queue.run_once(
+                    self._quiz_next_question_job,
+                    when=self.QUIZ_INTER_QUESTION_DELAY,
+                    data={"chat_id": chat_id, "qindex": captured_index},
+                    name=f"quiz-next-{chat_id}-{captured_index}",
+                )
+                state["jobs"].append(job)
+            except Exception as e:
+                logger.error(f"Quiz: не удалось запланировать следующий вопрос: {e}", exc_info=True)
+
+            return True
+        except Exception as e:
+            logger.error(f"Quiz: ошибка при проверке ответа: {e}", exc_info=True)
+            return False
+
+    async def _quiz_hint_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job: показывает подсказку (1 или 2) и планирует следующий шаг (вторую подсказку либо таймаут)."""
+        data = context.job.data or {}
+        chat_id = data.get("chat_id")
+        qindex = data.get("qindex")
+        hint_number = data.get("hint")
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled") or state["current_index"] != qindex:
+            return
+        if state.get("current_hints", 0) >= hint_number:
+            return
+        try:
+            q = state["questions"][qindex]
+            hint_text = q["hints"][hint_number - 1]
+            label = "💡 Подсказка 1" if hint_number == 1 else "💡 Подсказка 2"
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{label}: {hint_text}",
+                    reply_to_message_id=state.get("question_msg_id"),
+                )
+            except Exception as e:
+                logger.warning(f"Quiz: не удалось отправить подсказку (попытка без reply): {e}")
+                await context.bot.send_message(chat_id=chat_id, text=f"{label}: {hint_text}")
+            state["current_hints"] = hint_number
+
+            if hint_number == 1:
+                next_job = context.job_queue.run_once(
+                    self._quiz_hint_job,
+                    when=self.QUIZ_HINT2_DELAY,
+                    data={"chat_id": chat_id, "qindex": qindex, "hint": 2},
+                    name=f"quiz-hint2-{chat_id}-{qindex}",
+                )
+            else:
+                next_job = context.job_queue.run_once(
+                    self._quiz_timeout_job,
+                    when=self.QUIZ_TIMEOUT_DELAY,
+                    data={"chat_id": chat_id, "qindex": qindex},
+                    name=f"quiz-timeout-{chat_id}-{qindex}",
+                )
+            state["jobs"].append(next_job)
+        except Exception as e:
+            logger.error(f"Quiz: ошибка в hint job: {e}", exc_info=True)
+
+    async def _quiz_timeout_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job: время на вопрос вышло, ни одного правильного ответа."""
+        data = context.job.data or {}
+        chat_id = data.get("chat_id")
+        qindex = data.get("qindex")
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled") or state["current_index"] != qindex:
+            return
+        if not state.get("awaiting_answer"):
+            return
+        state["awaiting_answer"] = False
+        try:
+            q = state["questions"][qindex]
+            main_answer = (q.get("answers") or ["?"])[0]
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏱ Время вышло! Правильный ответ: <b>{main_answer}</b>",
+                    parse_mode='HTML',
+                    reply_to_message_id=state.get("question_msg_id"),
+                )
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏱ Время вышло! Правильный ответ: {main_answer}",
+                )
+            logger.info(f"Quiz chat={chat_id}: таймаут на вопросе {qindex + 1}")
+        except Exception as e:
+            logger.error(f"Quiz: ошибка в timeout job: {e}", exc_info=True)
+
+        try:
+            next_job = context.job_queue.run_once(
+                self._quiz_next_question_job,
+                when=self.QUIZ_INTER_QUESTION_DELAY,
+                data={"chat_id": chat_id, "qindex": qindex},
+                name=f"quiz-next-{chat_id}-{qindex}",
+            )
+            state["jobs"].append(next_job)
+        except Exception as e:
+            logger.error(f"Quiz: не удалось запланировать следующий вопрос после таймаута: {e}", exc_info=True)
+
+    async def _quiz_next_question_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job: переход к следующему вопросу либо завершение."""
+        data = context.job.data or {}
+        chat_id = data.get("chat_id")
+        prev_index = data.get("qindex")
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled"):
+            return
+        if state["current_index"] != prev_index:
+            return
+        state["current_index"] = prev_index + 1
+        state["current_hints"] = 0
+        state["awaiting_answer"] = False
+        state["question_msg_id"] = None
+        self._quiz_cancel_jobs(state)
+        if state["current_index"] >= len(state["questions"]):
+            await self._quiz_finish(chat_id, context)
+            return
+        await self._quiz_ask_question(chat_id, context)
+
+    async def _quiz_ask_question(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Постит вопрос N/10 и планирует первую подсказку через QUIZ_HINT1_DELAY секунд."""
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled"):
+            return
+        qindex = state["current_index"]
+        q = state["questions"][qindex]
+        text = f"❓ <b>Вопрос {qindex + 1}/10:</b>\n{q['question']}"
+        try:
+            msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
+            state["question_msg_id"] = msg.message_id
+        except Exception as e:
+            logger.error(f"Quiz: не удалось отправить вопрос {qindex + 1}: {e}", exc_info=True)
+            return
+        state["awaiting_answer"] = True
+        state["current_hints"] = 0
+        try:
+            job = context.job_queue.run_once(
+                self._quiz_hint_job,
+                when=self.QUIZ_HINT1_DELAY,
+                data={"chat_id": chat_id, "qindex": qindex, "hint": 1},
+                name=f"quiz-hint1-{chat_id}-{qindex}",
+            )
+            state["jobs"].append(job)
+        except Exception as e:
+            logger.error(f"Quiz: не удалось запланировать подсказку: {e}", exc_info=True)
+
+    async def _quiz_run_countdown(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Отправляет сообщение с обратным отсчётом 10..1 и удаляет его перед первым вопросом."""
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled"):
+            return
+        try:
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏳ Викторина начнётся через {self.QUIZ_COUNTDOWN_SECONDS} сек..."
+            )
+        except Exception as e:
+            logger.error(f"Quiz: не удалось отправить сообщение с отсчётом: {e}", exc_info=True)
+            return
+
+        try:
+            for remaining in range(self.QUIZ_COUNTDOWN_SECONDS - 1, 0, -1):
+                await asyncio.sleep(1)
+                if not self.active_quizzes.get(chat_id) or self.active_quizzes[chat_id].get("cancelled"):
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
+                        text=f"⏳ Викторина начнётся через {remaining} сек..."
+                    )
+                except Exception as e:
+                    logger.debug(f"Quiz: edit countdown failed: {e}")
+            await asyncio.sleep(1)
+        finally:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+            except Exception:
+                pass
+
+        state = self.active_quizzes.get(chat_id)
+        if not state or state.get("cancelled"):
+            return
+        await self._quiz_ask_question(chat_id, context)
+
+    async def _quiz_finish(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Завершает викторину: постит лидерборд сессии, сохраняет очки в БД, чистит состояние."""
+        state = self.active_quizzes.pop(chat_id, None)
+        if not state:
+            return
+        self._quiz_cancel_jobs(state)
+        topic = state.get("topic") or ""
+        scores = state.get("scores") or {}
+
+        if scores:
+            ranked = sorted(
+                scores.values(),
+                key=lambda r: (r.get("points", 0), r.get("correct", 0)),
+                reverse=True,
+            )
+            lines = [f"🏁 Викторина «{topic}» завершена!", ""]
+            for i, r in enumerate(ranked, start=1):
+                display = self._quiz_display_name(r)
+                lines.append(
+                    f"{i}. {display} — {r.get('points', 0)} оч. ({r.get('correct', 0)} прав.)"
+                )
+            text = "\n".join(lines)
+        else:
+            text = (
+                f"🏁 Викторина «{topic}» завершена!\n\n"
+                "Никто не дал ни одного правильного ответа."
+            )
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.error(f"Quiz: не удалось отправить итоги: {e}", exc_info=True)
+
+        self._quiz_persist_scores(state)
+        logger.info(f"Quiz chat={chat_id}: завершена, участников={len(scores)}")
+
+    async def quiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /quiz <тема> — генерирует и запускает викторину."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        chat_id = update.effective_chat.id
+
+        if chat_id in self.active_quizzes:
+            await update.message.reply_text(
+                "❗ В этом чате уже идёт викторина. Используйте /quizstop, чтобы её прервать."
+            )
+            return
+
+        message_text = update.message.text or ""
+        if message_text.startswith('/quiz'):
+            command_end = len('/quiz')
+            if len(message_text) > command_end and message_text[command_end] == '@':
+                space_pos = message_text.find(' ', command_end)
+                newline_pos = message_text.find('\n', command_end)
+                candidates = [p for p in (space_pos, newline_pos) if p != -1]
+                command_end = min(candidates) if candidates else len(message_text)
+            topic = message_text[command_end:].strip()
+        else:
+            topic = ' '.join(context.args) if context.args else ""
+
+        if not topic:
+            await update.message.reply_text(
+                "❌ Укажите тему викторины: /quiz <тема>\n"
+                "Например: /quiz рок-музыка 80-х"
+            )
+            return
+        if len(topic) > 200:
+            await update.message.reply_text("❌ Тема слишком длинная (макс. 200 символов).")
+            return
+
+        processing_msg = await update.message.reply_text(
+            f"🧠 Генерирую викторину на тему «{topic}»..."
+        )
+
+        try:
+            quiz_data = await self._generate_quiz_with_llm(topic, update.effective_user)
+            if not quiz_data:
+                await self.update_status(
+                    processing_msg,
+                    "❌ Не удалось сгенерировать викторину. Попробуйте ещё раз или другую тему."
+                )
+                return
+        except Exception as e:
+            logger.error(f"Quiz: ошибка генерации: {e}", exc_info=True)
+            await self.update_status(processing_msg, f"❌ Ошибка при генерации викторины: {str(e)}")
+            return
+
+        if chat_id in self.active_quizzes:
+            await update.message.reply_text("❗ В этом чате уже идёт викторина (стартовала параллельно).")
+            return
+
+        state = {
+            "topic": quiz_data.get("topic") or topic,
+            "questions": quiz_data["questions"],
+            "current_index": 0,
+            "current_hints": 0,
+            "awaiting_answer": False,
+            "scores": {},
+            "question_msg_id": None,
+            "jobs": [],
+            "started_by": update.effective_user.id,
+            "cancelled": False,
+        }
+        self.active_quizzes[chat_id] = state
+
+        try:
+            await self.update_status(
+                processing_msg,
+                f"✅ Викторина «{state['topic']}» готова! 10 вопросов, по 30 сек. на каждый."
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"Quiz chat={chat_id}: запущена пользователем {update.effective_user.id}, тема={state['topic']!r}"
+        )
+
+        asyncio.create_task(self._quiz_run_countdown(chat_id, context))
+
+    async def quizstop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /quizstop — прерывает текущую викторину в чате (без сохранения очков)."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        chat_id = update.effective_chat.id
+        state = self.active_quizzes.get(chat_id)
+        if not state:
+            await update.message.reply_text("Сейчас викторина не идёт.")
+            return
+        state["cancelled"] = True
+        self._quiz_cancel_jobs(state)
+        self.active_quizzes.pop(chat_id, None)
+        await update.message.reply_text("⏹ Викторина остановлена. Очки за неё не сохранены.")
+        logger.info(f"Quiz chat={chat_id}: остановлена пользователем {update.effective_user.id}")
+
+    async def quizleaderboards_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /quizleaderboards — топ-20 игроков по сумме очков."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT user_id, username, first_name, last_name,
+                           total_points, correct_answers, quizzes_played
+                    FROM quiz_scores
+                    ORDER BY total_points DESC, correct_answers DESC
+                    LIMIT 20
+                    """
+                )
+                rows = cursor.fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Quiz leaderboard: ошибка чтения БД: {e}", exc_info=True)
+            await update.message.reply_text("❌ Не удалось получить лидерборд.")
+            return
+
+        if not rows:
+            await update.message.reply_text("🏆 Лидерборд пока пуст.")
+            return
+
+        lines = ["🏆 <b>Лидерборд викторины (топ 20):</b>", ""]
+        for i, (user_id, username, first_name, last_name, total_points, correct, played) in enumerate(rows, start=1):
+            display = self._quiz_display_name({
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+            })
+            lines.append(
+                f"{i}. {display} — {total_points or 0} оч. "
+                f"({correct or 0} прав., {played or 0} викт.)"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+    # ========================= конец блока викторины =========================
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
         # Сохраняем изображения для последующего использования
@@ -2463,7 +3199,19 @@ class TelegramWhisperBot:
                 # Одиночное изображение - сохраняем как группу из одного
                 self.last_multiple_images[chat_id] = {'single': multiple_images}
                 logger.info(f"Сохранено одиночное изображение для чата {chat_id}")
-        
+
+        # Перехват ответов на активную викторину (только не-командные текстовые сообщения)
+        if (update.message and update.message.text
+                and not update.message.text.startswith('/')
+                and update.effective_chat
+                and update.effective_chat.id in self.active_quizzes):
+            try:
+                handled = await self._quiz_check_answer(update, context)
+                if handled:
+                    return
+            except Exception as e:
+                logger.error(f"Quiz: ошибка в перехвате ответа: {e}", exc_info=True)
+
         # Если сообщение начинается с /summary, но не обработалось как команда
         if update.message and update.message.text and update.message.text.startswith('/summary'):
             await self.summary_command(update, context)
@@ -6065,6 +6813,9 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("statistics", self.statistics_command))
         self.application.add_handler(CommandHandler("reload", self.reload_command))
         self.application.add_handler(CommandHandler("randomsteamgame", self.randomsteamgame_command))
+        self.application.add_handler(CommandHandler("quiz", self.quiz_command))
+        self.application.add_handler(CommandHandler("quizstop", self.quizstop_command))
+        self.application.add_handler(CommandHandler("quizleaderboards", self.quizleaderboards_command))
         # Турнирные команды
         self.application.add_handler(CommandHandler("reg", self.reg_command))
         self.application.add_handler(CommandHandler("reglist", self.reglist_command))
