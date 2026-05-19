@@ -3057,7 +3057,7 @@ class TelegramWhisperBot:
         try:
             await self.update_status(
                 processing_msg,
-                f"✅ Викторина «{state['topic']}» готова! 10 вопросов, по 30 сек. на каждый."
+                f"✅ Викторина «{state['topic']}» готова! 10 вопросов, по 45 сек. на каждый."
             )
         except Exception:
             pass
