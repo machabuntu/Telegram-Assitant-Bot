@@ -899,7 +899,8 @@ class TelegramWhisperBot:
             "🎮 **Steam:**\n"
             "• `/randomsteamgame` - ссылка на случайную игру из Steam\n\n"
             "🧠 **Викторина:**\n"
-            "• `/quiz <тема>` - запустить викторину на 10 вопросов\n"
+            "• `/quiz <тема>` - викторина на 10 вопросов\n"
+            "• `/gigaquiz <тема>` - гигавикторина на 30 вопросов\n"
             "• `/quizstop` - остановить текущую викторину\n"
             "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
             "💰 **Баланс и статистика:**\n"
@@ -2440,13 +2441,13 @@ class TelegramWhisperBot:
             s = s.strip()
         return s
 
-    def _quiz_validate_questions(self, data) -> Optional[dict]:
-        """Проверяет, что в распарсенном JSON ровно 10 валидных вопросов; возвращает нормализованный dict или None."""
+    def _quiz_validate_questions(self, data, num_questions: int = 10) -> Optional[dict]:
+        """Проверяет, что в распарсенном JSON ровно num_questions валидных вопросов; возвращает нормализованный dict или None."""
         if not isinstance(data, dict):
             return None
         questions = data.get("questions")
-        if not isinstance(questions, list) or len(questions) != 10:
-            logger.warning(f"Quiz JSON: ожидалось 10 вопросов, получено {len(questions) if isinstance(questions, list) else 'не список'}")
+        if not isinstance(questions, list) or len(questions) != num_questions:
+            logger.warning(f"Quiz JSON: ожидалось {num_questions} вопросов, получено {len(questions) if isinstance(questions, list) else 'не список'}")
             return None
         validated = []
         for i, q in enumerate(questions):
@@ -2526,7 +2527,7 @@ class TelegramWhisperBot:
             logger.error(f"Quiz: ошибка при отправке запроса в OpenRouter: {e}", exc_info=True)
             return None
 
-    async def _generate_quiz_with_llm(self, topic: str, user) -> Optional[dict]:
+    async def _generate_quiz_with_llm(self, topic: str, user, num_questions: int = 10) -> Optional[dict]:
         """Генерирует викторину на тему через OpenRouter (gemini-3.1-pro-preview).
 
         Делает одну повторную попытку при невалидном JSON. Возвращает dict {topic, questions:[...]} или None.
@@ -2537,7 +2538,7 @@ class TelegramWhisperBot:
         prompt = (
             f'Сгенерируй викторину на тему "{topic}".\n\n'
             "Требования:\n"
-            "- РОВНО 10 вопросов.\n"
+            f"- РОВНО {num_questions} вопросов.\n"
             "- Для каждого вопроса: основной правильный ответ + список альтернативных формулировок "
             "(русское и английское написание, общеупотребимые синонимы, прозвища, распространённые сокращения). "
             "От 1 до 8 вариантов в списке.\n"
@@ -2557,7 +2558,7 @@ class TelegramWhisperBot:
             '      "answers": ["основной ответ", "альтернатива 1", "..."],\n'
             '      "hints": ["менее очевидная подсказка", "более очевидная подсказка"]\n'
             "    }\n"
-            "    // ... ещё 9 объектов\n"
+            f"    // ... ещё {num_questions - 1} объектов\n"
             "  ]\n"
             "}"
         )
@@ -2586,13 +2587,13 @@ class TelegramWhisperBot:
             except json.JSONDecodeError as e:
                 logger.warning(f"Quiz: попытка {attempt} — невалидный JSON: {e}; сырой текст: {self._single_line_log_preview(cleaned, 500)}")
                 continue
-            validated = self._quiz_validate_questions(parsed)
+            validated = self._quiz_validate_questions(parsed, num_questions=num_questions)
             if validated is None:
                 logger.warning(f"Quiz: попытка {attempt} — JSON не прошёл валидацию")
                 continue
             if not validated.get("topic"):
                 validated["topic"] = topic
-            logger.info(f"Quiz: успешно сгенерировано 10 вопросов на тему {topic!r} (попытка {attempt})")
+            logger.info(f"Quiz: успешно сгенерировано {num_questions} вопросов на тему {topic!r} (попытка {attempt})")
             return validated
 
         return None
@@ -2878,13 +2879,14 @@ class TelegramWhisperBot:
         await self._quiz_ask_question(chat_id, context)
 
     async def _quiz_ask_question(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        """Постит вопрос N/10 и планирует первую подсказку через QUIZ_HINT1_DELAY секунд."""
+        """Постит очередной вопрос и планирует первую подсказку через QUIZ_HINT1_DELAY секунд."""
         state = self.active_quizzes.get(chat_id)
         if not state or state.get("cancelled"):
             return
         qindex = state["current_index"]
         q = state["questions"][qindex]
-        text = f"❓ <b>Вопрос {qindex + 1}/10:</b>\n{q['question']}"
+        total = len(state["questions"])
+        text = f"❓ <b>Вопрос {qindex + 1}/{total}:</b>\n{q['question']}"
         try:
             msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
             state["question_msg_id"] = msg.message_id
@@ -2954,6 +2956,7 @@ class TelegramWhisperBot:
             return
         self._quiz_cancel_jobs(state)
         topic = state.get("topic") or ""
+        label = state.get("label") or "Викторина"
         scores = state.get("scores") or {}
 
         if scores:
@@ -2962,7 +2965,7 @@ class TelegramWhisperBot:
                 key=lambda r: (r.get("points", 0), r.get("correct", 0)),
                 reverse=True,
             )
-            lines = [f"🏁 Викторина «{topic}» завершена!", ""]
+            lines = [f"🏁 {label} «{topic}» завершена!", ""]
             for i, r in enumerate(ranked, start=1):
                 display = self._quiz_display_name(r)
                 lines.append(
@@ -2971,7 +2974,7 @@ class TelegramWhisperBot:
             text = "\n".join(lines)
         else:
             text = (
-                f"🏁 Викторина «{topic}» завершена!\n\n"
+                f"🏁 {label} «{topic}» завершена!\n\n"
                 "Никто не дал ни одного правильного ответа."
             )
 
@@ -2983,66 +2986,63 @@ class TelegramWhisperBot:
         self._quiz_persist_scores(state)
         logger.info(f"Quiz chat={chat_id}: завершена, участников={len(scores)}")
 
-    async def quiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик /quiz <тема> — генерирует и запускает викторину."""
-        if not self.is_authorized_channel(update):
-            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
-            return
-
-        chat_id = update.effective_chat.id
-
-        if chat_id in self.active_quizzes:
-            await update.message.reply_text(
-                "❗ В этом чате уже идёт викторина. Используйте /quizstop, чтобы её прервать."
-            )
-            return
-
-        message_text = update.message.text or ""
-        if message_text.startswith('/quiz'):
-            command_end = len('/quiz')
+    def _extract_quiz_topic(self, message_text: str, args, command: str) -> str:
+        """Извлекает тему из сообщения /<command> ..., корректно учитывая @botname после команды."""
+        message_text = message_text or ""
+        if message_text.startswith(command):
+            command_end = len(command)
             if len(message_text) > command_end and message_text[command_end] == '@':
                 space_pos = message_text.find(' ', command_end)
                 newline_pos = message_text.find('\n', command_end)
                 candidates = [p for p in (space_pos, newline_pos) if p != -1]
                 command_end = min(candidates) if candidates else len(message_text)
-            topic = message_text[command_end:].strip()
-        else:
-            topic = ' '.join(context.args) if context.args else ""
+            return message_text[command_end:].strip()
+        return ' '.join(args) if args else ""
 
-        if not topic:
-            await update.message.reply_text(
-                "❌ Укажите тему викторины: /quiz <тема>\n"
-                "Например: /quiz рок-музыка 80-х"
-            )
-            return
-        if len(topic) > 200:
-            await update.message.reply_text("❌ Тема слишком длинная (макс. 200 символов).")
-            return
+    async def _start_quiz_session(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        topic: str,
+        num_questions: int,
+        label: str,
+    ):
+        """Общий запуск викторины: генерация через LLM, инициализация state и запуск countdown.
+
+        Должно вызываться после проверок is_authorized_channel, busy-чека и валидации темы.
+        """
+        chat_id = update.effective_chat.id
 
         processing_msg = await update.message.reply_text(
-            f"🧠 Генерирую викторину на тему «{topic}»..."
+            f"🧠 Генерирую {label.lower()} на тему «{topic}»..."
         )
 
         try:
-            quiz_data = await self._generate_quiz_with_llm(topic, update.effective_user)
+            quiz_data = await self._generate_quiz_with_llm(
+                topic, update.effective_user, num_questions=num_questions
+            )
             if not quiz_data:
                 await self.update_status(
                     processing_msg,
-                    "❌ Не удалось сгенерировать викторину. Попробуйте ещё раз или другую тему."
+                    f"❌ Не удалось сгенерировать {label.lower()}. Попробуйте ещё раз или другую тему."
                 )
                 return
         except Exception as e:
-            logger.error(f"Quiz: ошибка генерации: {e}", exc_info=True)
-            await self.update_status(processing_msg, f"❌ Ошибка при генерации викторины: {str(e)}")
+            logger.error(f"Quiz ({label}): ошибка генерации: {e}", exc_info=True)
+            await self.update_status(processing_msg, f"❌ Ошибка при генерации: {str(e)}")
             return
 
         if chat_id in self.active_quizzes:
-            await update.message.reply_text("❗ В этом чате уже идёт викторина (стартовала параллельно).")
+            await update.message.reply_text(
+                f"❗ В этом чате уже идёт викторина (стартовала параллельно)."
+            )
             return
 
         state = {
             "topic": quiz_data.get("topic") or topic,
             "questions": quiz_data["questions"],
+            "num_questions": num_questions,
+            "label": label,
             "current_index": 0,
             "current_hints": 0,
             "awaiting_answer": False,
@@ -3057,16 +3057,72 @@ class TelegramWhisperBot:
         try:
             await self.update_status(
                 processing_msg,
-                f"✅ Викторина «{state['topic']}» готова! 10 вопросов, по 45 сек. на каждый."
+                f"✅ {label} «{state['topic']}» готова! {num_questions} вопросов, по 45 сек. на каждый."
             )
         except Exception:
             pass
 
         logger.info(
-            f"Quiz chat={chat_id}: запущена пользователем {update.effective_user.id}, тема={state['topic']!r}"
+            f"Quiz chat={chat_id}: запущена ({label}, N={num_questions}) пользователем {update.effective_user.id}, тема={state['topic']!r}"
         )
 
         asyncio.create_task(self._quiz_run_countdown(chat_id, context))
+
+    async def quiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /quiz <тема> — викторина на 10 вопросов."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        chat_id = update.effective_chat.id
+        if chat_id in self.active_quizzes:
+            await update.message.reply_text(
+                "❗ В этом чате уже идёт викторина. Используйте /quizstop, чтобы её прервать."
+            )
+            return
+
+        topic = self._extract_quiz_topic(update.message.text, context.args, "/quiz")
+        if not topic:
+            await update.message.reply_text(
+                "❌ Укажите тему викторины: /quiz <тема>\n"
+                "Например: /quiz рок-музыка 80-х"
+            )
+            return
+        if len(topic) > 200:
+            await update.message.reply_text("❌ Тема слишком длинная (макс. 200 символов).")
+            return
+
+        await self._start_quiz_session(
+            update, context, topic, num_questions=10, label="Викторина"
+        )
+
+    async def gigaquiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /gigaquiz <тема> — гигавикторина на 30 вопросов."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        chat_id = update.effective_chat.id
+        if chat_id in self.active_quizzes:
+            await update.message.reply_text(
+                "❗ В этом чате уже идёт викторина. Используйте /quizstop, чтобы её прервать."
+            )
+            return
+
+        topic = self._extract_quiz_topic(update.message.text, context.args, "/gigaquiz")
+        if not topic:
+            await update.message.reply_text(
+                "❌ Укажите тему гигавикторины: /gigaquiz <тема>\n"
+                "Например: /gigaquiz история СССР"
+            )
+            return
+        if len(topic) > 200:
+            await update.message.reply_text("❌ Тема слишком длинная (макс. 200 символов).")
+            return
+
+        await self._start_quiz_session(
+            update, context, topic, num_questions=30, label="Гигавикторина"
+        )
 
     async def quizstop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик /quizstop — прерывает текущую викторину в чате (без сохранения очков)."""
@@ -6818,6 +6874,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("reload", self.reload_command))
         self.application.add_handler(CommandHandler("randomsteamgame", self.randomsteamgame_command))
         self.application.add_handler(CommandHandler("quiz", self.quiz_command))
+        self.application.add_handler(CommandHandler("gigaquiz", self.gigaquiz_command))
         self.application.add_handler(CommandHandler("quizstop", self.quizstop_command))
         self.application.add_handler(CommandHandler("quizleaderboards", self.quizleaderboards_command))
         # Турнирные команды
