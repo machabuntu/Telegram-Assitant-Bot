@@ -13,7 +13,7 @@ generated_images/
 # Конфиденциальные данные
 config.json
 cookies.txt
-
+selected_models.json
 # База данных статистики
 user_statistics.db
 
