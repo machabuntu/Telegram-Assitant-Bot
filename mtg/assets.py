@@ -7,6 +7,18 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_ROOT = PROJECT_ROOT / "mtg_assets"
 
+_DEFAULT_FONT_FILES = {
+    "matrixcyrillic": "Matrix B_ Cyrillic Regular.ttf",
+    "timesnewroman": "timesnewromanpsmt.ttf",
+    "timesnewromanitalic": "timesnewromanps_italicmt.ttf",
+    "gothammedium": "gotham-medium.ttf",
+    "mana": "mana.ttf",
+    "belerenbsc": "beleren-bsc.ttf",
+    "belerenb": "beleren-b.ttf",
+    "mplantin": "mplantin.ttf",
+    "mplantini": "mplantin-i.ttf",
+}
+
 
 class Assets:
     FRAMES_SHOWCASE = ASSETS_ROOT / "img" / "frames" / "m15" / "genericShowcase"
@@ -18,6 +30,8 @@ class Assets:
     PW_IMAGES = ASSETS_ROOT / "data" / "images" / "cardImages" / "planeswalker"
     SET_SYMBOLS = ASSETS_ROOT / "img" / "setSymbols" / "official"
 
+    _font_files: dict[str, str] = dict(_DEFAULT_FONT_FILES)
+
     COLOR_MAP = {
         "W": "W", "U": "U", "B": "B", "R": "R", "G": "G",
         "M": "M", "A": "A", "L": "L", "C": "A",
@@ -26,6 +40,13 @@ class Assets:
         "W": "w", "U": "u", "B": "b", "R": "r", "G": "g",
         "M": "m", "A": "a", "L": "l", "C": "a",
     }
+
+    @classmethod
+    def configure_fonts(cls, font_files: dict[str, str] | None) -> None:
+        """Merge font filename overrides from layout.yaml fonts.files."""
+        cls._font_files = dict(_DEFAULT_FONT_FILES)
+        if font_files:
+            cls._font_files.update(font_files)
 
     @classmethod
     def showcase_frame(cls, color_code: str) -> Path:
@@ -48,20 +69,11 @@ class Assets:
 
     @classmethod
     def font(cls, name: str) -> Path:
-        mapping = {
-            "belerenb": "beleren-b.ttf",
-            "belerenbsc": "beleren-bsc.ttf",
-            "mplantin": "mplantin.ttf",
-            "mplantini": "mplantin-i.ttf",
-            "gothammedium": "gotham-medium.ttf",
-            "matrix": "matrix.ttf",
-            "matrixb": "matrix-b.ttf",
-            "mana": "mana.ttf",
-        }
-        primary = cls.FONTS / mapping.get(name, f"{name}.ttf")
+        filename = cls._font_files.get(name, f"{name}.ttf")
+        primary = cls.FONTS / filename
         if primary.exists():
             return primary
-        alt = cls.FONTS_ALT / mapping.get(name, f"{name}.ttf")
+        alt = cls.FONTS_ALT / filename
         if alt.exists():
             return alt
         return primary

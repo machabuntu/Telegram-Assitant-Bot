@@ -1,5 +1,15 @@
 # Card layout configuration — pixels at 1500×2100 reference canvas.
 
+# Font keys used below → filenames in mtg_assets/data/fonts/
+fonts:
+  files:
+    matrixcyrillic: "Matrix B_ Cyrillic Regular.ttf"
+    timesnewroman: timesnewromanpsmt.ttf
+    timesnewromanitalic: timesnewromanps_italicmt.ttf
+    gothammedium: gotham-medium.ttf
+    mana: mana.ttf
+    belerenbsc: beleren-bsc.ttf
+
 canvas:
   width: 1500
   height: 2100
@@ -35,42 +45,42 @@ standard:
   art_bottom_ratio: 0.9224
   title:
     box: [128, 110, 1243, 114]
-    font: belerenb
+    font: matrixcyrillic
     font_size: 62
   mana:
     y: 128
     right: 1394
   type:
     box: [128, 1189, 1243, 114]
-    font: belerenb
+    font: matrixcyrillic
     font_size: 55
   rules:
     box: [129, 1323, 1242, 604]
-    font: mplantin
+    font: timesnewroman
     max_size: 58
     min_size: 20
   flavor:
-    font: mplantini
+    font: timesnewromanitalic
     max_size: 60
     min_size: 50
   pt:
     box_pos: [1136, 1858]
     text_center: [1292, 1915]
-    font: belerenbsc
+    font: matrixcyrillic
     font_size: 60
     clearance_y: 1858
 
 planeswalker:
   title:
     box: [128, 90, 1100, 100]
-    font: belerenb
+    font: matrixcyrillic
     font_size: 62
   mana:
     y: 105
     right: 1394
   type:
     box: [128, 1189, 1243, 114]
-    font: belerenb
+    font: matrixcyrillic
     font_size: 55
   ability:
     start_y: 1340
@@ -78,13 +88,13 @@ planeswalker:
     width: 1150
     height: 200
     gap: 0
-    font: mplantin
+    font: timesnewroman
     max_size: 50
     min_size: 30
     icon_size: [180, 140]
     overlay_color: [200, 200, 200, 220]
     overlay_padding: 10
-    cost_font: belerenb
+    cost_font: matrixcyrillic
     cost_font_size: 50
     cost_text_offset_x: 85
     cost_text_offset_y_plus: 45
@@ -93,5 +103,5 @@ planeswalker:
   loyalty:
     x: 1314
     y: 1890
-    font: belerenb
+    font: matrixcyrillic
     font_size: 65

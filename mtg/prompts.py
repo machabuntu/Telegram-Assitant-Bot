@@ -11,11 +11,15 @@ CROP_USER = """\
 Координаты нормализованы от 0 до 1000. Никакого другого текста."""
 
 CARD_TEXT_SYSTEM = """\
-You are an expert Magic: The Gathering card designer. Given an image, design a complete MTG card \
-inspired by it. Return ONLY structured fields — no commentary, no markdown fences."""
+You are an expert Magic: The Gathering card designer with a sharp sense of humor. Given an image, \
+design a complete MTG card inspired by it. The card should be funny and witty. \
+Return ONLY structured fields — no commentary, no markdown fences."""
 
 CARD_TEXT_USER = """\
 Проанализируй изображение и придумай карту Magic: The Gathering, вдохновлённую им.
+
+Карта должна быть юморной: смешное название, забавные правила или способности, ироничный flavor-текст. \
+Юмор может быть абсурдным, сатиричным или игривым, но текст должен оставаться читаемым и узнаваемым как карта MTG.
 
 Разрешённые типы карт:
 - standard — Creature, Instant, Sorcery, Enchantment, Enchantment-Aura или Artifact

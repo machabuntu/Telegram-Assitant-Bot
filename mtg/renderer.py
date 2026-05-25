@@ -29,6 +29,7 @@ def _load_layout() -> dict:
 
 
 _L = _load_layout()
+Assets.configure_fonts(_L.get("fonts", {}).get("files"))
 
 CANVAS_W: int = _L.get("canvas", {}).get("width", 1500)
 CANVAS_H: int = _L.get("canvas", {}).get("height", 2100)

@@ -3207,6 +3207,7 @@ class TelegramWhisperBot:
         api_config: dict,
         model: str,
         system_text: str | None = None,
+        temperature: float | None = None,
     ) -> Optional[tuple]:
         """Vision-запрос к OpenRouter. Возвращает (text, generation_id) или None."""
         try:
@@ -3230,6 +3231,8 @@ class TelegramWhisperBot:
                 ],
             })
             data = {"model": model, "messages": messages, "max_tokens": 4000}
+            if temperature is not None:
+                data["temperature"] = temperature
             logger.info(f"MCG: vision-запрос OpenRouter (модель: {model})")
             response = await asyncio.to_thread(
                 requests.post, api_config["url"], headers=headers, json=data, timeout=300
@@ -3299,8 +3302,14 @@ class TelegramWhisperBot:
         from mtg.prompts import CARD_TEXT_SYSTEM, CARD_TEXT_USER
 
         text_model = api_config.get("text_model", "google/gemini-3.1-pro-preview")
+        text_temperature = api_config.get("text_temperature", 0.9)
         result = await self._mcg_openrouter_vision(
-            cropped_image, CARD_TEXT_USER, api_config, text_model, system_text=CARD_TEXT_SYSTEM
+            cropped_image,
+            CARD_TEXT_USER,
+            api_config,
+            text_model,
+            system_text=CARD_TEXT_SYSTEM,
+            temperature=text_temperature,
         )
         if not result:
             return None
