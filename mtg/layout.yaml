@@ -1,0 +1,97 @@
+# Card layout configuration — pixels at 1500×2100 reference canvas.
+
+canvas:
+  width: 1500
+  height: 2100
+
+mana_symbols:
+  size: 70
+  spacing: 4
+
+text:
+  flavor_gap: 45
+  paragraph_gap: 14
+
+rarity_symbol:
+  size: 120
+  right: 1370
+  y_offset: -6
+
+footer:
+  left_x: 100
+  right_x: 1400
+  left_line1_y: 1975
+  left_line2_y: 2010
+  left_line3_y: 2045
+  right_line1_y: 2010
+  right_line2_y: 2040
+  font: gothammedium
+  font_size: 35
+  nib_size: 28
+  color_light: "#FFFFFF"
+  color_dark: "#FFFFFF"
+
+standard:
+  art_bottom_ratio: 0.9224
+  title:
+    box: [128, 110, 1243, 114]
+    font: belerenb
+    font_size: 62
+  mana:
+    y: 128
+    right: 1394
+  type:
+    box: [128, 1189, 1243, 114]
+    font: belerenb
+    font_size: 55
+  rules:
+    box: [129, 1323, 1242, 604]
+    font: mplantin
+    max_size: 58
+    min_size: 20
+  flavor:
+    font: mplantini
+    max_size: 60
+    min_size: 50
+  pt:
+    box_pos: [1136, 1858]
+    text_center: [1292, 1915]
+    font: belerenbsc
+    font_size: 60
+    clearance_y: 1858
+
+planeswalker:
+  title:
+    box: [128, 90, 1100, 100]
+    font: belerenb
+    font_size: 62
+  mana:
+    y: 105
+    right: 1394
+  type:
+    box: [128, 1189, 1243, 114]
+    font: belerenb
+    font_size: 55
+  ability:
+    start_y: 1340
+    x: 230
+    width: 1150
+    height: 200
+    gap: 0
+    font: mplantin
+    max_size: 50
+    min_size: 30
+    icon_size: [180, 140]
+    overlay_color: [200, 200, 200, 220]
+    overlay_padding: 10
+    cost_font: belerenb
+    cost_font_size: 50
+    cost_text_offset_x: 85
+    cost_text_offset_y_plus: 45
+    cost_text_offset_y_minus: 33
+    cost_text_offset_y_neutral: 38
+  loyalty:
+    x: 1314
+    y: 1890
+    font: belerenb
+    font_size: 65

@@ -9,7 +9,7 @@ __pycache__/
 # Сгенерированные изображения
 generated_images/
 !generated_images/README.md
-
+MTGCardGenerator/
 # Конфиденциальные данные
 config.json
 cookies.txt

@@ -1,0 +1,51 @@
+"""AI prompt templates for /mcg."""
+
+CROP_SYSTEM = """\
+You are a computer vision assistant. Analyze images and return crop coordinates as JSON only."""
+
+CROP_USER = """\
+Проанализируй изображение. Найди главный объект (существо, лицо, предмет). \
+Определи координаты самого оптимального вертикального прямоугольника (соотношение сторон 3:4), \
+который включает этот объект полностью и выглядит композиционно приятно. \
+Верни координаты строго в формате JSON: {"xmin": 0-1000, "ymin": 0-1000, "xmax": 0-1000, "ymax": 0-1000}. \
+Координаты нормализованы от 0 до 1000. Никакого другого текста."""
+
+CARD_TEXT_SYSTEM = """\
+You are an expert Magic: The Gathering card designer. Given an image, design a complete MTG card \
+inspired by it. Return ONLY structured fields — no commentary, no markdown fences."""
+
+CARD_TEXT_USER = """\
+Проанализируй изображение и придумай карту Magic: The Gathering, вдохновлённую им.
+
+Разрешённые типы карт:
+- standard — Creature, Instant, Sorcery, Enchantment, Enchantment-Aura или Artifact
+- planeswalker — Planeswalker с ровно 3 способностями
+
+Запрещено: Land, Saga, Token и любые другие типы.
+
+Весь игровой текст карты (название, type line, rules, flavor, способности) пиши на русском языке.
+Символы маны в rules/abilities — в формате {W}, {U}, {B}, {R}, {G}, {C}, {2}, {T} и т.д.
+Не включай reminder text для ключевых слов.
+Не используй сокращения и ~ вместо имени карты — всегда пиши полное название.
+
+Верни поля (одно на строку, через двоеточие):
+
+CARD_TYPE: standard или planeswalker
+NAME: <название карты>
+COLORS: <цветовая identity: W, U, B, R, G, C или комбинация, напр. WU>
+RARITY: <common, uncommon, rare или mythic>
+MANA_COST: <стоимость, напр. 2RR или 1WU>
+TYPE_LINE: <полная строка типа, напр. "Существо — Человек Маг">
+
+Для CARD_TYPE: standard также добавь:
+POWER: <сила, если creature, иначе пусто>
+TOUGHNESS: <выносливость, если creature, иначе пусто>
+RULES_TEXT: <правила; используй \\n для переносов строк>
+FLAVOR_TEXT: <флavor-текст в кавычках или пусто>
+
+Для CARD_TYPE: planeswalker также добавь:
+STARTING_LOYALTY: <целое число>
+ABILITY_1: <+N: текст способности>
+ABILITY_2: <−N: текст способности>
+ABILITY_3: <−N: текст способности (ультимейт)>
+"""

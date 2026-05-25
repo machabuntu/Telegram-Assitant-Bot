@@ -903,6 +903,8 @@ class TelegramWhisperBot:
             "• `/gigaquiz <тема>` - гигавикторина на 30 вопросов\n"
             "• `/quizstop` - остановить текущую викторину\n"
             "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
+            "🃏 **MTG-карты:**\n"
+            "• `/mcg` - генерация MTG-карты из последнего изображения в чате\n\n"
             "💰 **Баланс и статистика:**\n"
             "• `/balance` - проверка остатка средств на OpenRouter\n"
             "• `/statistics` - статистика расходов пользователей\n\n"
@@ -3188,6 +3190,196 @@ class TelegramWhisperBot:
         await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
     # ========================= конец блока викторины =========================
+
+    def _mcg_image_mime_type(self, image_data: bytes) -> str:
+        if image_data.startswith(b'\x89PNG'):
+            return "image/png"
+        if image_data.startswith(b'GIF'):
+            return "image/gif"
+        if image_data.startswith(b'RIFF') and b'WEBP' in image_data[:20]:
+            return "image/webp"
+        return "image/jpeg"
+
+    async def _mcg_openrouter_vision(
+        self,
+        image_data: bytes,
+        user_text: str,
+        api_config: dict,
+        model: str,
+        system_text: str | None = None,
+    ) -> Optional[tuple]:
+        """Vision-запрос к OpenRouter. Возвращает (text, generation_id) или None."""
+        try:
+            mime_type = self._mcg_image_mime_type(image_data)
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            headers = {
+                "Authorization": f"Bearer {api_config['key']}",
+                "Content-Type": "application/json",
+            }
+            messages = []
+            if system_text:
+                messages.append({"role": "system", "content": system_text})
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+                    },
+                ],
+            })
+            data = {"model": model, "messages": messages, "max_tokens": 4000}
+            logger.info(f"MCG: vision-запрос OpenRouter (модель: {model})")
+            response = await asyncio.to_thread(
+                requests.post, api_config["url"], headers=headers, json=data, timeout=300
+            )
+            if response.status_code != 200:
+                logger.error(f"MCG OpenRouter error: {response.status_code} - {self._truncate_http_error_body(response.text)}")
+                return None
+            result = response.json()
+            logger.info(f"Ответ OpenRouter (mcg): {self._format_api_result_for_log(result)}")
+            text = result['choices'][0]['message']['content']
+            generation_id = self.get_generation_id_from_response(result)
+            return (text, generation_id)
+        except Exception as e:
+            logger.error(f"MCG: ошибка vision-запроса: {e}", exc_info=True)
+            return None
+
+    async def _mcg_track_cost(self, generation_id: Optional[str], user, command: str = "mcg"):
+        if generation_id and user is not None:
+            try:
+                await self.track_generation_cost(
+                    generation_id,
+                    user.id,
+                    user.username or "",
+                    user.first_name or "",
+                    user.last_name or "",
+                    command,
+                )
+            except Exception as e:
+                logger.warning(f"MCG: не удалось затрекать стоимость: {e}")
+
+    async def _mcg_crop_image(self, image_data: bytes, api_config: dict, user) -> Optional[bytes]:
+        from mtg.crop import (
+            crop_by_normalized_coords,
+            crop_landscape_3_4_fallback,
+            crop_portrait_2_3,
+            get_image_orientation,
+            parse_crop_json,
+        )
+        from mtg.prompts import CROP_SYSTEM, CROP_USER
+
+        orientation = await asyncio.to_thread(get_image_orientation, image_data)
+        if orientation == "portrait":
+            logger.info("MCG: portrait — center crop 2:3")
+            return await asyncio.to_thread(crop_portrait_2_3, image_data)
+
+        crop_model = api_config.get("crop_model", "google/gemini-3-flash-preview")
+        result = await self._mcg_openrouter_vision(
+            image_data, CROP_USER, api_config, crop_model, system_text=CROP_SYSTEM
+        )
+        if result:
+            text, generation_id = result
+            await self._mcg_track_cost(generation_id, user)
+            coords = parse_crop_json(text)
+            if coords:
+                logger.info(f"MCG: landscape crop coords {coords}")
+                return await asyncio.to_thread(
+                    crop_by_normalized_coords,
+                    image_data,
+                    coords["xmin"], coords["ymin"], coords["xmax"], coords["ymax"],
+                )
+            logger.warning(f"MCG: не удалось распарсить crop JSON, fallback 3:4. Ответ: {self._single_line_log_preview(text, 300)}")
+
+        logger.info("MCG: landscape fallback — center crop 3:4")
+        return await asyncio.to_thread(crop_landscape_3_4_fallback, image_data)
+
+    async def _mcg_generate_card_text(self, cropped_image: bytes, api_config: dict, user) -> Optional[str]:
+        from mtg.prompts import CARD_TEXT_SYSTEM, CARD_TEXT_USER
+
+        text_model = api_config.get("text_model", "google/gemini-3.1-pro-preview")
+        result = await self._mcg_openrouter_vision(
+            cropped_image, CARD_TEXT_USER, api_config, text_model, system_text=CARD_TEXT_SYSTEM
+        )
+        if not result:
+            return None
+        text, generation_id = result
+        await self._mcg_track_cost(generation_id, user)
+        return text
+
+    async def mcg_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /mcg — генерация MTG-карты из последнего изображения в чате."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+
+        try:
+            image_data = await self.get_last_image_from_chat(update, context, chat_id)
+            if not image_data:
+                await update.message.reply_text(
+                    "❌ Не найдено изображений в чате.\n\n"
+                    "**Как использовать команду /mcg:**\n"
+                    "1. Сначала отправьте изображение в чат\n"
+                    "2. Затем используйте команду `/mcg`"
+                )
+                return
+
+            processing_msg = await update.message.reply_text("🃏 Готовлю MTG-карту…")
+
+            api_config = self.get_api_config("mcg_api")
+
+            await self.update_status(processing_msg, "✂️ Обрезаю изображение…")
+            cropped_image = await self._mcg_crop_image(image_data, api_config, user)
+            if not cropped_image:
+                await self.update_status(processing_msg, "❌ Не удалось обрезать изображение.")
+                return
+
+            await self.update_status(processing_msg, "🤖 Генерирую текст карты…")
+            card_text = await self._mcg_generate_card_text(cropped_image, api_config, user)
+            if not card_text:
+                await self.update_status(processing_msg, "❌ Не удалось сгенерировать текст карты.")
+                return
+
+            from mtg.parser import parse_card_response
+            from mtg.renderer import render_card_to_bytes
+
+            details = parse_card_response(card_text)
+            logger.info(f"MCG: карта «{details.name}», тип={details.card_type}, colors={details.colors}")
+
+            await self.update_status(processing_msg, "🎨 Собираю карту…")
+
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as art_file:
+                art_file.write(cropped_image)
+                art_path = Path(art_file.name)
+
+            try:
+                card_bytes = await asyncio.to_thread(render_card_to_bytes, details, art_path)
+            finally:
+                try:
+                    art_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            if not card_bytes:
+                await self.update_status(processing_msg, "❌ Не удалось собрать карту.")
+                return
+
+            self.save_generated_image(card_bytes, "png", chat_id, "mcg")
+            self.last_images[chat_id] = card_bytes
+
+            await self.update_status(processing_msg, "✅ Готово!")
+            card_file = BytesIO(card_bytes)
+            card_file.name = "mtg_card.png"
+            caption = f"🃏 **{details.name}**\n{details.type_line}"
+            await update.message.reply_photo(photo=card_file, caption=caption)
+
+        except Exception as e:
+            logger.error(f"MCG: ошибка: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
@@ -6900,6 +7092,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("gigaquiz", self.gigaquiz_command))
         self.application.add_handler(CommandHandler("quizstop", self.quizstop_command))
         self.application.add_handler(CommandHandler("quizleaderboards", self.quizleaderboards_command))
+        self.application.add_handler(CommandHandler("mcg", self.mcg_command))
         # Турнирные команды
         self.application.add_handler(CommandHandler("reg", self.reg_command))
         self.application.add_handler(CommandHandler("reglist", self.reglist_command))
