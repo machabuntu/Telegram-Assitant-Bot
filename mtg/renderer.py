@@ -9,12 +9,12 @@ from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
-import cairosvg
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 
 from mtg.assets import Assets
 from mtg.models import CardDetails
+from mtg.svg_utils import svg_to_pil
 
 log = logging.getLogger(__name__)
 
@@ -143,8 +143,7 @@ def _load_mana_svg(symbol: str, size: int = MANA_SYMBOL_SIZE) -> Image.Image | N
     if not path.exists():
         log.warning("Mana symbol not found: %s", path)
         return None
-    png_data = cairosvg.svg2png(url=str(path), output_width=size, output_height=size)
-    return Image.open(io.BytesIO(png_data)).convert("RGBA")
+    return svg_to_pil(path, size)
 
 
 @lru_cache(maxsize=32)
@@ -170,8 +169,7 @@ def _load_rarity_svg(rarity: str, size: int = RARITY_SIZE) -> Image.Image | None
     if not path.exists():
         log.warning("Rarity symbol not found: %s", path)
         return None
-    png_data = cairosvg.svg2png(url=str(path), output_width=size, output_height=size)
-    return Image.open(io.BytesIO(png_data)).convert("RGBA")
+    return svg_to_pil(path, size)
 
 
 def _frame_color_code(colors: str) -> str:
