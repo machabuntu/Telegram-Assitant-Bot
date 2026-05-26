@@ -25,10 +25,12 @@ class Assets:
     FRAMES_PW_BORDERLESS = ASSETS_ROOT / "img" / "frames" / "planeswalker" / "borderless"
     PT_BOXES = ASSETS_ROOT / "img" / "frames" / "m15" / "nickname"
     MANA_SYMBOLS = ASSETS_ROOT / "img" / "manaSymbols"
+    MANA_SYMBOLS_PNG = ASSETS_ROOT / "img" / "manaSymbols_png"
     FONTS = ASSETS_ROOT / "data" / "fonts"
     FONTS_ALT = ASSETS_ROOT / "fonts"
     PW_IMAGES = ASSETS_ROOT / "data" / "images" / "cardImages" / "planeswalker"
     SET_SYMBOLS = ASSETS_ROOT / "img" / "setSymbols" / "official"
+    SET_SYMBOLS_PNG = ASSETS_ROOT / "img" / "setSymbols_png" / "official"
 
     _font_files: dict[str, str] = dict(_DEFAULT_FONT_FILES)
 
@@ -62,6 +64,23 @@ class Assets:
     def pt_box(cls, color_code: str) -> Path:
         c = cls.COLOR_MAP.get(color_code, "M")
         return cls.PT_BOXES / f"m15NicknamePT{c}.png"
+
+    @classmethod
+    def mana_symbol_png(cls, symbol: str) -> Path | None:
+        sym = symbol.lower().strip()
+        candidates = [sym]
+        if "/" in sym:
+            candidates.append(sym.replace("/", ""))
+        for alt in candidates:
+            path = cls.MANA_SYMBOLS_PNG / f"{alt}.png"
+            if path.exists():
+                return path
+        return None
+
+    @classmethod
+    def rarity_symbol_png(cls, stem: str) -> Path | None:
+        path = cls.SET_SYMBOLS_PNG / f"{stem}.png"
+        return path if path.exists() else None
 
     @classmethod
     def mana_symbol(cls, symbol: str) -> Path:

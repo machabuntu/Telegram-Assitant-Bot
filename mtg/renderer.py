@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from mtg.assets import Assets
 from mtg.models import CardDetails
-from mtg.svg_utils import svg_to_pil
+from mtg.raster_utils import load_raster
 
 log = logging.getLogger(__name__)
 
@@ -140,11 +140,11 @@ _DARK_TEXT_FRAMES = {"W", "A", "M"}
 
 @lru_cache(maxsize=256)
 def _load_mana_svg(symbol: str, size: int = MANA_SYMBOL_SIZE) -> Image.Image | None:
-    path = Assets.mana_symbol(symbol)
-    if not path.exists():
-        log.warning("Mana symbol not found: %s", path)
+    path = Assets.mana_symbol_png(symbol)
+    if not path:
+        log.warning("Mana symbol PNG not found: %s", symbol)
         return None
-    return svg_to_pil(path, size)
+    return load_raster(path, size)
 
 
 @lru_cache(maxsize=32)
@@ -166,11 +166,11 @@ def _load_frame(path: Path) -> Image.Image | None:
 @lru_cache(maxsize=16)
 def _load_rarity_svg(rarity: str, size: int = RARITY_SIZE) -> Image.Image | None:
     stem = _RARITY_SVG_MAP.get(rarity.lower(), "unf-c")
-    path = Assets.SET_SYMBOLS / f"{stem}.svg"
-    if not path.exists():
-        log.warning("Rarity symbol not found: %s", path)
+    path = Assets.rarity_symbol_png(stem)
+    if not path:
+        log.warning("Rarity symbol PNG not found: %s", stem)
         return None
-    return svg_to_pil(path, size)
+    return load_raster(path, size)
 
 
 def _frame_color_code(colors: str) -> str:
