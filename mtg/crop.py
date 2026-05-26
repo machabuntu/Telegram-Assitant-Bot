@@ -7,6 +7,10 @@ from typing import Optional
 
 from PIL import Image
 
+ASPECT_W = 5
+ASPECT_H = 7
+TARGET_RATIO = ASPECT_W / ASPECT_H
+
 
 def center_crop_aspect(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """Center-crop *image* to the given aspect ratio (width:height)."""
@@ -26,13 +30,34 @@ def center_crop_aspect(image: Image.Image, target_w: int, target_h: int) -> Imag
     return image.crop(box)
 
 
-def crop_portrait_2_3(image_bytes: bytes) -> bytes:
-    """Center crop portrait image to 2:3 aspect ratio."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    cropped = center_crop_aspect(img, 2, 3)
+def is_aspect_5_7(width: int, height: int, tolerance: float = 0.02) -> bool:
+    """Return True if width/height is within *tolerance* of 5:7."""
+    if height <= 0:
+        return False
+    return abs(width / height - TARGET_RATIO) <= tolerance
+
+
+def _image_to_png_bytes(img: Image.Image) -> bytes:
     out = io.BytesIO()
-    cropped.save(out, format="PNG")
+    img.convert("RGB").save(out, format="PNG")
     return out.getvalue()
+
+
+def crop_center_5_7(image_bytes: bytes) -> bytes:
+    """Center crop image to 5:7 aspect ratio."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    cropped = center_crop_aspect(img, ASPECT_W, ASPECT_H)
+    return _image_to_png_bytes(cropped)
+
+
+def ensure_aspect_5_7(image_bytes: bytes, tolerance: float = 0.02) -> bytes:
+    """Ensure image is 5:7; center-crop edges if not."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if is_aspect_5_7(w, h, tolerance):
+        return _image_to_png_bytes(img)
+    cropped = center_crop_aspect(img, ASPECT_W, ASPECT_H)
+    return _image_to_png_bytes(cropped)
 
 
 def crop_by_normalized_coords(
@@ -52,18 +77,7 @@ def crop_by_normalized_coords(
     bottom = max(top + 1, min(h, int(ymax / 1000 * h)))
 
     cropped = img.crop((left, top, right, bottom))
-    out = io.BytesIO()
-    cropped.save(out, format="PNG")
-    return out.getvalue()
-
-
-def crop_landscape_3_4_fallback(image_bytes: bytes) -> bytes:
-    """Center crop to 3:4 aspect ratio (fallback when AI coords fail)."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    cropped = center_crop_aspect(img, 3, 4)
-    out = io.BytesIO()
-    cropped.save(out, format="PNG")
-    return out.getvalue()
+    return _image_to_png_bytes(cropped)
 
 
 def get_image_orientation(image_bytes: bytes) -> str:

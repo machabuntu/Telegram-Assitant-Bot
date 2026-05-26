@@ -97,10 +97,15 @@ class Assets:
     @classmethod
     def font(cls, name: str) -> Path:
         filename = cls._font_files.get(name, f"{name}.ttf")
-        primary = cls.FONTS / filename
-        if primary.exists():
-            return primary
-        alt = cls.FONTS_ALT / filename
-        if alt.exists():
-            return alt
-        return primary
+        for base in (cls.FONTS, cls.FONTS_ALT):
+            path = base / filename
+            if path.exists():
+                return path
+        # layout.yaml may reference a missing file; try built-in default mapping
+        default_filename = _DEFAULT_FONT_FILES.get(name)
+        if default_filename and default_filename != filename:
+            for base in (cls.FONTS, cls.FONTS_ALT):
+                path = base / default_filename
+                if path.exists():
+                    return path
+        return cls.FONTS / filename

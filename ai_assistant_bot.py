@@ -3266,8 +3266,8 @@ class TelegramWhisperBot:
     async def _mcg_crop_image(self, image_data: bytes, api_config: dict, user) -> Optional[bytes]:
         from mtg.crop import (
             crop_by_normalized_coords,
-            crop_landscape_3_4_fallback,
-            crop_portrait_2_3,
+            crop_center_5_7,
+            ensure_aspect_5_7,
             get_image_orientation,
             parse_crop_json,
         )
@@ -3275,28 +3275,37 @@ class TelegramWhisperBot:
 
         orientation = await asyncio.to_thread(get_image_orientation, image_data)
         if orientation == "portrait":
-            logger.info("MCG: portrait — center crop 2:3")
-            return await asyncio.to_thread(crop_portrait_2_3, image_data)
+            logger.info("MCG: portrait — center crop 5:7")
+            return await asyncio.to_thread(crop_center_5_7, image_data)
 
         crop_model = api_config.get("crop_model", "google/gemini-3-flash-preview")
-        result = await self._mcg_openrouter_vision(
-            image_data, CROP_USER, api_config, crop_model, system_text=CROP_SYSTEM
-        )
-        if result:
+        for attempt in (1, 2):
+            logger.info(f"MCG: landscape crop attempt {attempt}/2")
+            result = await self._mcg_openrouter_vision(
+                image_data, CROP_USER, api_config, crop_model, system_text=CROP_SYSTEM
+            )
+            if not result:
+                logger.warning(f"MCG: crop attempt {attempt} — пустой ответ от API")
+                continue
             text, generation_id = result
             await self._mcg_track_cost(generation_id, user)
             coords = parse_crop_json(text)
-            if coords:
-                logger.info(f"MCG: landscape crop coords {coords}")
-                return await asyncio.to_thread(
-                    crop_by_normalized_coords,
-                    image_data,
-                    coords["xmin"], coords["ymin"], coords["xmax"], coords["ymax"],
+            if not coords:
+                logger.warning(
+                    f"MCG: crop attempt {attempt} — невалидный JSON: "
+                    f"{self._single_line_log_preview(text, 300)}"
                 )
-            logger.warning(f"MCG: не удалось распарсить crop JSON, fallback 3:4. Ответ: {self._single_line_log_preview(text, 300)}")
+                continue
+            logger.info(f"MCG: landscape crop coords {coords} (attempt {attempt})")
+            cropped = await asyncio.to_thread(
+                crop_by_normalized_coords,
+                image_data,
+                coords["xmin"], coords["ymin"], coords["xmax"], coords["ymax"],
+            )
+            return await asyncio.to_thread(ensure_aspect_5_7, cropped)
 
-        logger.info("MCG: landscape fallback — center crop 3:4")
-        return await asyncio.to_thread(crop_landscape_3_4_fallback, image_data)
+        logger.error("MCG: не удалось получить координаты обрезки после 2 попыток")
+        return None
 
     async def _mcg_generate_card_text(self, cropped_image: bytes, api_config: dict, user) -> Optional[str]:
         from mtg.prompts import CARD_TEXT_SYSTEM, CARD_TEXT_USER
@@ -3344,7 +3353,15 @@ class TelegramWhisperBot:
             await self.update_status(processing_msg, "✂️ Обрезаю изображение…")
             cropped_image = await self._mcg_crop_image(image_data, api_config, user)
             if not cropped_image:
-                await self.update_status(processing_msg, "❌ Не удалось обрезать изображение.")
+                from mtg.crop import get_image_orientation
+                orientation = await asyncio.to_thread(get_image_orientation, image_data)
+                if orientation == "landscape":
+                    await self.update_status(
+                        processing_msg,
+                        "❌ Не удалось определить область обрезки для landscape-изображения.",
+                    )
+                else:
+                    await self.update_status(processing_msg, "❌ Не удалось обрезать изображение.")
                 return
 
             await self.update_status(processing_msg, "🤖 Генерирую текст карты…")
@@ -3384,7 +3401,7 @@ class TelegramWhisperBot:
             card_file = BytesIO(card_bytes)
             card_file.name = "mtg_card.png"
             caption = f"🃏 **{details.name}**\n{details.type_line}"
-            await update.message.reply_photo(photo=card_file, caption=caption)
+            await update.message.reply_photo(photo=card_file, caption=caption, parse_mode='Markdown')
 
         except Exception as e:
             logger.error(f"MCG: ошибка: {e}", exc_info=True)
