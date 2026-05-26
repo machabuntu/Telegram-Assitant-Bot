@@ -3,7 +3,7 @@
 # Font keys used below → filenames in mtg_assets/data/fonts/
 fonts:
   files:
-    matrixcyrillic: "Matrix B_ Cyrillic Regular.ttf"
+    minioncyrillic: "Minion Cyrillic Bold.ttf"
     timesnewroman: timesnewromanpsmt.ttf
     timesnewromanitalic: timesnewromanps_italicmt.ttf
     gothammedium: gotham-medium.ttf
@@ -45,14 +45,14 @@ standard:
   art_bottom_ratio: 0.9224
   title:
     box: [128, 110, 1243, 114]
-    font: matrixcyrillic
+    font: minioncyrillic
     font_size: 62
   mana:
     y: 128
     right: 1394
   type:
     box: [128, 1189, 1243, 114]
-    font: matrixcyrillic
+    font: minioncyrillic
     font_size: 55
   rules:
     box: [129, 1323, 1242, 604]
@@ -66,21 +66,21 @@ standard:
   pt:
     box_pos: [1136, 1858]
     text_center: [1292, 1915]
-    font: matrixcyrillic
+    font: belerenbsc
     font_size: 60
     clearance_y: 1858
 
 planeswalker:
   title:
     box: [128, 90, 1100, 100]
-    font: matrixcyrillic
+    font: minioncyrillic
     font_size: 62
   mana:
     y: 105
     right: 1394
   type:
     box: [128, 1189, 1243, 114]
-    font: matrixcyrillic
+    font: minioncyrillic
     font_size: 55
   ability:
     start_y: 1340
@@ -94,7 +94,7 @@ planeswalker:
     icon_size: [180, 140]
     overlay_color: [200, 200, 200, 220]
     overlay_padding: 10
-    cost_font: matrixcyrillic
+    cost_font: belerenbsc
     cost_font_size: 50
     cost_text_offset_x: 85
     cost_text_offset_y_plus: 45
@@ -103,5 +103,5 @@ planeswalker:
   loyalty:
     x: 1314
     y: 1890
-    font: matrixcyrillic
+    font: belerenbsc
     font_size: 65

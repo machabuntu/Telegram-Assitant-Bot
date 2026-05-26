@@ -18,6 +18,10 @@ _FIELD_LINE_RE = re.compile(
 )
 
 _PT_RE = re.compile(r"^[\d*+-]+$")
+_MANA_INNER_RE = re.compile(
+    r"^[0-9]{1,2}$|^[WUBRGCXST]$|^[WUBRGC]{1,2}/[WUBRGC]{1,2}$",
+    re.IGNORECASE,
+)
 
 
 def _parse_field(text: str, field: str) -> str:
@@ -45,7 +49,75 @@ def _normalise_rules(raw: str, card_name: str = "") -> str:
     text = raw.replace("\\n", "\n").strip()
     if card_name:
         text = text.replace("~", card_name)
+    return _normalise_mana_braces(text)
+
+
+def _normalise_mana_braces(text: str) -> str:
+    """Ensure inline mana uses {symbol} tokens the renderer understands."""
+    if not text:
+        return text
+
+    # (T) or {tap} → {T}
+    text = re.sub(r"\(\s*[Tt]\s*\)", "{T}", text)
+    text = re.sub(r"\{[Tt]ap\}", "{T}", text, flags=re.IGNORECASE)
+    text = re.sub(r"\{повернуть\}", "{T}", text, flags=re.IGNORECASE)
+
+    # Collapse spaced braces: { R } → {R}
+    text = re.sub(r"\{\s*([^}]+?)\s*\}", lambda m: "{" + m.group(1).strip().upper() + "}", text)
+
     return text
+
+
+def _normalise_mana_cost(raw: str) -> str:
+    """Normalize MANA_COST to a string the renderer can parse."""
+    if not raw:
+        return ""
+    cost = raw.strip().strip('"').strip("'")
+    cost = cost.replace("\u2212", "-")
+
+    # Already all-brace format like {2}{R}{R}
+    if cost.startswith("{") and "}" in cost:
+        tokens = re.findall(r"\{([^}]+)\}", cost)
+        parts: list[str] = []
+        for token in tokens:
+            inner = token.strip().upper().replace(" ", "")
+            if not inner:
+                continue
+            if inner.isdigit() or _MANA_INNER_RE.match(inner):
+                parts.append("{" + inner + "}")
+                continue
+            # {2RR} or {1WU} — expand compact form inside braces
+            expanded: list[str] = []
+            i = 0
+            while i < len(inner):
+                ch = inner[i]
+                if ch.isdigit():
+                    num = ch
+                    while i + 1 < len(inner) and inner[i + 1].isdigit():
+                        i += 1
+                        num += inner[i]
+                    expanded.append("{" + num + "}")
+                elif ch in "WUBRGCXST":
+                    expanded.append("{" + ch + "}")
+                i += 1
+            parts.extend(expanded)
+        return "".join(parts)
+
+    # Plain compact form: 2RR, 1WU, X, etc.
+    parts = []
+    i = 0
+    while i < len(cost):
+        ch = cost[i]
+        if ch.isdigit():
+            num = ch
+            while i + 1 < len(cost) and cost[i + 1].isdigit():
+                i += 1
+                num += cost[i]
+            parts.append("{" + num + "}")
+        elif ch.upper() in "WUBRGCXST":
+            parts.append("{" + ch.upper() + "}")
+        i += 1
+    return "".join(parts)
 
 
 def _parse_card_type(text: str) -> str:
@@ -57,7 +129,7 @@ def _parse_card_type(text: str) -> str:
 
 def _parse_response_standard(text: str) -> CardDetails:
     name = _parse_field(text, "NAME") or "Безымянная карта"
-    mana_cost = _parse_field(text, "MANA_COST")
+    mana_cost = _normalise_mana_cost(_parse_field(text, "MANA_COST"))
     type_line = _parse_field(text, "TYPE_LINE")
     colors = _parse_field(text, "COLORS").upper().replace(" ", "")
     rarity = _parse_field(text, "RARITY").lower() or "common"
@@ -82,7 +154,7 @@ def _parse_response_standard(text: str) -> CardDetails:
 
 def _parse_response_planeswalker(text: str) -> CardDetails:
     name = _parse_field(text, "NAME") or "Безымянный planeswalker"
-    mana_cost = _parse_field(text, "MANA_COST")
+    mana_cost = _normalise_mana_cost(_parse_field(text, "MANA_COST"))
     type_line = _parse_field(text, "TYPE_LINE")
     colors = _parse_field(text, "COLORS").upper().replace(" ", "")
     rarity = _parse_field(text, "RARITY").lower() or "rare"
@@ -92,7 +164,7 @@ def _parse_response_planeswalker(text: str) -> CardDetails:
     for key in ("ABILITY_1", "ABILITY_2", "ABILITY_3", "ABILITY_4"):
         val = _parse_field(text, key)
         if val:
-            abilities.append(val)
+            abilities.append(_normalise_mana_braces(val))
 
     try:
         loyalty = int(loyalty_str)

@@ -231,21 +231,32 @@ def _render_footer(draw: ImageDraw.ImageDraw, cc: str) -> None:
 
 
 def _parse_mana_cost(mana_cost: str) -> list[str]:
-    if "{" in mana_cost:
-        return [m.lower() for m in _MANA_RE.findall(mana_cost)]
+    """Parse mana cost into symbol keys for SVG lookup (e.g. '2', 'r', 'wu')."""
+    if not mana_cost:
+        return []
+    text = mana_cost.strip()
     symbols: list[str] = []
-    i = 0
-    while i < len(mana_cost):
-        ch = mana_cost[i]
-        if ch.isdigit():
-            num = ch
-            while i + 1 < len(mana_cost) and mana_cost[i + 1].isdigit():
-                i += 1
-                num += mana_cost[i]
-            symbols.append(num)
-        elif ch.upper() in "WUBRGCXST":
-            symbols.append(ch.lower())
-        i += 1
+
+    for part in re.split(r"(\{[^}]+\})", text):
+        if not part:
+            continue
+        if part.startswith("{") and part.endswith("}"):
+            inner = part[1:-1].strip()
+            if inner:
+                symbols.append(inner.lower().replace(" ", ""))
+            continue
+        i = 0
+        while i < len(part):
+            ch = part[i]
+            if ch.isdigit():
+                num = ch
+                while i + 1 < len(part) and part[i + 1].isdigit():
+                    i += 1
+                    num += part[i]
+                symbols.append(num)
+            elif ch.upper() in "WUBRGCXST":
+                symbols.append(ch.lower())
+            i += 1
     return symbols
 
 

@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_ROOT = PROJECT_ROOT / "mtg_assets"
 
 _DEFAULT_FONT_FILES = {
-    "matrixcyrillic": "Matrix B_ Cyrillic Regular.ttf",
+    "minioncyrillic": "Minion Cyrillic Bold.ttf",
     "timesnewroman": "timesnewromanpsmt.ttf",
     "timesnewromanitalic": "timesnewromanps_italicmt.ttf",
     "gothammedium": "gotham-medium.ttf",
@@ -65,7 +65,15 @@ class Assets:
 
     @classmethod
     def mana_symbol(cls, symbol: str) -> Path:
-        return cls.MANA_SYMBOLS / f"{symbol.lower()}.svg"
+        sym = symbol.lower().strip()
+        candidates = [sym]
+        if "/" in sym:
+            candidates.append(sym.replace("/", ""))
+        for alt in candidates:
+            path = cls.MANA_SYMBOLS / f"{alt}.svg"
+            if path.exists():
+                return path
+        return cls.MANA_SYMBOLS / f"{sym}.svg"
 
     @classmethod
     def font(cls, name: str) -> Path:
