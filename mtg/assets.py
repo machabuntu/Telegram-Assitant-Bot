@@ -10,7 +10,7 @@ ASSETS_ROOT = PROJECT_ROOT / "mtg_assets"
 _DEFAULT_FONT_FILES = {
     "minioncyrillic": "Minion Cyrillic Bold.ttf",
     "timesnewroman": "timesnewromanpsmt.ttf",
-    "timesnewromanitalic": "timesnewromanps_italicmt.ttf",
+    "timesnewromanitalic": "timesnrcyrmt_inclined.ttf",
     "gothammedium": "gotham-medium.ttf",
     "mana": "mana.ttf",
     "belerenbsc": "beleren-bsc.ttf",
