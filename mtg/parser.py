@@ -183,8 +183,14 @@ def _parse_response_planeswalker(text: str) -> CardDetails:
     )
 
 
+def _normalize_yo_to_e(text: str) -> str:
+    """Replace yo (Ё/ё) with ye (Е/е) in generated card text."""
+    return text.translate(str.maketrans("ёЁ", "еЕ"))
+
+
 def parse_card_response(text: str) -> CardDetails:
     """Parse AI response text into CardDetails."""
+    text = _normalize_yo_to_e(text)
     card_type = _parse_card_type(text)
     if card_type == "planeswalker":
         return _parse_response_planeswalker(text)
