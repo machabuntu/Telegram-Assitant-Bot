@@ -18,6 +18,7 @@ from drive_storage import DriveStorage
 
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import requests
 import time
@@ -837,7 +838,126 @@ class TelegramWhisperBot:
             await message.edit_text(status_text)
         except Exception as e:
             logger.error(f"Ошибка при обновлении статуса: {e}")
-    
+
+    def _photo_request_timeouts(self) -> dict:
+        """Таймауты для sendPhoto/reply_photo (загрузка больших PNG)."""
+        return {
+            "connect_timeout": 15,
+            "read_timeout": 30,
+            "write_timeout": 60,
+        }
+
+    async def _reply_photo_safe(self, message, photo, caption: str, **kwargs) -> bool:
+        """Отправляет фото; TimedOut не считается фатальной ошибкой для пользователя."""
+        try:
+            await message.reply_photo(
+                photo=photo,
+                caption=caption,
+                **self._photo_request_timeouts(),
+                **kwargs,
+            )
+            return True
+        except TimedOut:
+            logger.warning("reply_photo TimedOut — фото могло быть доставлено в Telegram")
+            return True
+
+    async def _save_image_after_delivery(
+        self,
+        chat_id: int,
+        command_type: str,
+        image_bytes: bytes,
+        image_format: str,
+    ) -> None:
+        """Сохраняет изображение локально и в Drive после отправки в Telegram."""
+        await asyncio.to_thread(
+            self.save_generated_image,
+            image_bytes,
+            image_format,
+            chat_id,
+            command_type,
+        )
+
+    async def _deliver_ai_image_result(
+        self,
+        update: Update,
+        image_result,
+        *,
+        caption: str,
+        command_type: str,
+        file_basename: str = "generated_image",
+        **reply_kwargs,
+    ) -> bool:
+        """Сначала отправляет фото пользователю, затем сохраняет локально/Drive."""
+        chat_id = update.effective_chat.id
+
+        if isinstance(image_result, dict):
+            if "data" in image_result and "format" in image_result:
+                image_bytes = image_result["data"]
+                image_format = image_result["format"]
+                self.last_generated_images[chat_id] = image_bytes
+
+                image_file = BytesIO(image_bytes)
+                image_file.name = f"{file_basename}.{image_format}"
+
+                photo_sent = await self._reply_photo_safe(
+                    update.message, image_file, caption, **reply_kwargs
+                )
+                if photo_sent:
+                    await self._save_image_after_delivery(
+                        chat_id, command_type, image_bytes, image_format
+                    )
+                return photo_sent
+
+            if "url" in image_result:
+                image_url = image_result["url"]
+                photo_sent = await self._reply_photo_safe(
+                    update.message, image_url, caption, **reply_kwargs
+                )
+                if photo_sent:
+                    try:
+                        response = await asyncio.to_thread(
+                            requests.get, image_url, timeout=30
+                        )
+                        if response.status_code == 200:
+                            image_bytes = response.content
+                            content_type = response.headers.get("content-type", "image/jpeg")
+                            image_format = content_type.split("/")[-1].split(";")[0]
+                            self.last_generated_images[chat_id] = image_bytes
+                            await self._save_image_after_delivery(
+                                chat_id, command_type, image_bytes, image_format
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Не удалось скачать изображение для сохранения: %s", e
+                        )
+                return photo_sent
+
+        elif isinstance(image_result, str):
+            image_url = image_result
+            photo_sent = await self._reply_photo_safe(
+                update.message, image_url, caption, **reply_kwargs
+            )
+            if photo_sent:
+                try:
+                    response = await asyncio.to_thread(
+                        requests.get, image_url, timeout=30
+                    )
+                    if response.status_code == 200:
+                        image_bytes = response.content
+                        content_type = response.headers.get("content-type", "image/jpeg")
+                        image_format = content_type.split("/")[-1].split(";")[0]
+                        self.last_generated_images[chat_id] = image_bytes
+                        await self._save_image_after_delivery(
+                            chat_id, command_type, image_bytes, image_format
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось скачать изображение для сохранения: %s", e
+                    )
+            return photo_sent
+
+        return False
+
     async def describe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /describe"""
         # Проверяем, что сообщение пришло из разрешенного канала
@@ -1324,6 +1444,7 @@ class TelegramWhisperBot:
         prompt = ' '.join(context.args)
         logger.info(f"Генерация изображения по запросу: {prompt}")
         
+        photo_sent = False
         try:
             # Создаем сообщение о начале обработки
             processing_msg = await update.message.reply_text(
@@ -1359,56 +1480,14 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображение успешно сгенерировано!")
             
-            # Проверяем, что мы получили - URL или base64 данные
-            if isinstance(image_result, dict):
-                # Если это словарь с base64 данными
-                if 'data' in image_result and 'format' in image_result:
-                    image_bytes = image_result['data']
-                    image_format = image_result['format']
-                    
-                    # Сохраняем изображение в папку
-                    chat_id = update.effective_chat.id
-                    self.save_generated_image(image_bytes, image_format, chat_id, "imagegen")
-                    
-                    # Сохраняем в хранилище последних сгенерированных изображений
-                    self.last_generated_images[chat_id] = image_bytes
-                    
-                    # Создаем BytesIO объект из байтов
-                    image_file = BytesIO(image_bytes)
-                    image_file.name = f"generated_image.{image_format}"
-                    
-                    # Отправляем изображение как файл
-                    await update.message.reply_photo(
-                        photo=image_file,
-                        caption=f"🎨 **Сгенерированное изображение**\n\n📝 Запрос: {prompt}"
-                    )
-                # Если это словарь с URL
-                elif 'url' in image_result:
-                    image_url = image_result['url']
-                    # Скачиваем изображение для сохранения
-                    try:
-                        response = requests.get(image_url, timeout=30)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            # Определяем формат по content-type
-                            content_type = response.headers.get('content-type', 'image/jpeg')
-                            image_format = content_type.split('/')[-1]
-                            
-                            # Сохраняем изображение
-                            chat_id = update.effective_chat.id
-                            self.save_generated_image(image_bytes, image_format, chat_id, "imagegen")
-                            
-                            # Сохраняем в хранилище
-                            self.last_generated_images[chat_id] = image_bytes
-                    except Exception as e:
-                        logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                    
-                    # Отправляем URL
-                    await update.message.reply_photo(
-                        photo=image_url,
-                        caption=f"🎨 **Сгенерированное изображение**\n\n📝 Запрос: {prompt}"
-                    )
-            else:
+            photo_sent = await self._deliver_ai_image_result(
+                update,
+                image_result,
+                caption=f"🎨 **Сгенерированное изображение**\n\n📝 Запрос: {prompt}",
+                command_type="imagegen",
+                file_basename="generated_image",
+            )
+            if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
             
             # Отслеживаем стоимость
@@ -1422,7 +1501,8 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при генерации изображения: {e}")
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def abcgen_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /abcgen - генерация русской азбуки"""
@@ -1442,6 +1522,7 @@ class TelegramWhisperBot:
         full_prompt = f'Нарисуй русскую азбуку "{user_prompt}" с заголовком и подписями. Avoid cropped borders. Content should correctly fit into the picture.'
         logger.info(f"Генерация русской азбуки по запросу: {user_prompt}")
         
+        photo_sent = False
         try:
             # Создаем сообщение о начале обработки
             processing_msg = await update.message.reply_text(
@@ -1477,73 +1558,15 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Азбука успешно сгенерирована!")
             
-            # Проверяем, что мы получили - URL или base64 данные
-            if isinstance(image_result, dict):
-                # Если это словарь с base64 данными
-                if 'data' in image_result and 'format' in image_result:
-                    image_bytes = image_result['data']
-                    image_format = image_result['format']
-                    
-                    # Сохраняем изображение в папку
-                    chat_id = update.effective_chat.id
-                    self.save_generated_image(image_bytes, image_format, chat_id, "abcgen")
-                    
-                    # Сохраняем в хранилище последних сгенерированных изображений
-                    self.last_generated_images[chat_id] = image_bytes
-                    
-                    # Создаем BytesIO объект из байтов
-                    image_file = BytesIO(image_bytes)
-                    image_file.name = f"alphabet_{user_prompt[:20]}.{image_format}"
-                    
-                    # Отправляем изображение как файл
-                    await update.message.reply_photo(
-                        photo=image_file,
-                        caption=f"🔤 **Русская азбука**\n\n📝 Тема: {user_prompt}"
-                    )
-                # Если это словарь с URL
-                elif 'url' in image_result:
-                    image_url = image_result['url']
-                    # Скачиваем изображение для сохранения
-                    try:
-                        response = requests.get(image_url, timeout=30)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            # Определяем формат по content-type
-                            content_type = response.headers.get('content-type', 'image/jpeg')
-                            image_format = content_type.split('/')[-1]
-                            
-                            # Сохраняем изображение
-                            chat_id = update.effective_chat.id
-                            self.save_generated_image(image_bytes, image_format, chat_id, "abcgen")
-                            
-                            # Сохраняем в хранилище
-                            self.last_generated_images[chat_id] = image_bytes
-                    except Exception as e:
-                        logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                    
-                    await update.message.reply_photo(
-                        photo=image_url,
-                        caption=f"🔤 **Русская азбука**\n\n📝 Тема: {user_prompt}"
-                    )
-            else:
-                # Если это строка (URL)
-                try:
-                    response = requests.get(image_result, timeout=30)
-                    if response.status_code == 200:
-                        image_bytes = response.content
-                        content_type = response.headers.get('content-type', 'image/jpeg')
-                        image_format = content_type.split('/')[-1]
-                        
-                        chat_id = update.effective_chat.id
-                        self.save_generated_image(image_bytes, image_format, chat_id, "abcgen")
-                        self.last_generated_images[chat_id] = image_bytes
-                except Exception as e:
-                    logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                
-                await update.message.reply_photo(
-                    photo=image_result,
-                    caption=f"🔤 **Русская азбука**\n\n📝 Тема: {user_prompt}"
-                )
+            photo_sent = await self._deliver_ai_image_result(
+                update,
+                image_result,
+                caption=f"🔤 **Русская азбука**\n\n📝 Тема: {user_prompt}",
+                command_type="abcgen",
+                file_basename=f"alphabet_{user_prompt[:20]}",
+            )
+            if not photo_sent:
+                await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
             
             # Отслеживаем стоимость успешного запроса
             if generation_id:
@@ -1556,7 +1579,8 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при генерации азбуки: {e}")
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def imagechange_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /imagechange"""
@@ -1574,6 +1598,7 @@ class TelegramWhisperBot:
         prompt = ' '.join(context.args)
         logger.info(f"Изменение изображения по запросу: {prompt}")
         
+        photo_sent = False
         try:
             # Получаем последнее изображение из чата
             chat_id = update.effective_chat.id
@@ -1625,56 +1650,14 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображение успешно изменено!")
             
-            # Проверяем, что мы получили - URL или base64 данные
-            if isinstance(image_result, dict):
-                # Если это словарь с base64 данными
-                if 'data' in image_result and 'format' in image_result:
-                    image_bytes = image_result['data']
-                    image_format = image_result['format']
-                    
-                    # Сохраняем изображение в папку
-                    chat_id = update.effective_chat.id
-                    self.save_generated_image(image_bytes, image_format, chat_id, "imagechange")
-                    
-                    # Сохраняем в хранилище последних сгенерированных изображений
-                    self.last_generated_images[chat_id] = image_bytes
-                    
-                    # Создаем BytesIO объект из байтов
-                    image_file = BytesIO(image_bytes)
-                    image_file.name = f"modified_image.{image_format}"
-                    
-                    # Отправляем изображение как файл
-                    await update.message.reply_photo(
-                        photo=image_file,
-                        caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}"
-                    )
-                # Если это словарь с URL
-                elif 'url' in image_result:
-                    image_url = image_result['url']
-                    # Скачиваем изображение для сохранения
-                    try:
-                        response = requests.get(image_url, timeout=30)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            # Определяем формат по content-type
-                            content_type = response.headers.get('content-type', 'image/jpeg')
-                            image_format = content_type.split('/')[-1]
-                            
-                            # Сохраняем изображение
-                            chat_id = update.effective_chat.id
-                            self.save_generated_image(image_bytes, image_format, chat_id, "imagechange")
-                            
-                            # Сохраняем в хранилище
-                            self.last_generated_images[chat_id] = image_bytes
-                    except Exception as e:
-                        logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                    
-                    # Отправляем URL
-                    await update.message.reply_photo(
-                        photo=image_url,
-                        caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}"
-                    )
-            else:
+            photo_sent = await self._deliver_ai_image_result(
+                update,
+                image_result,
+                caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}",
+                command_type="imagechange",
+                file_basename="modified_image",
+            )
+            if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
             
             # Отслеживаем стоимость
@@ -1688,7 +1671,8 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при изменении изображения: {e}")
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def changelast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /changelast - изменяет последнее сгенерированное изображение"""
@@ -1706,6 +1690,7 @@ class TelegramWhisperBot:
         prompt = ' '.join(context.args)
         logger.info(f"Изменение последнего сгенерированного изображения по запросу: {prompt}")
         
+        photo_sent = False
         try:
             # Получаем последнее сгенерированное изображение для этого чата
             chat_id = update.effective_chat.id
@@ -1756,54 +1741,14 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображение успешно изменено!")
             
-            # Проверяем, что мы получили - URL или base64 данные
-            if isinstance(image_result, dict):
-                # Если это словарь с base64 данными
-                if 'data' in image_result and 'format' in image_result:
-                    image_bytes = image_result['data']
-                    image_format = image_result['format']
-                    
-                    # Сохраняем изображение в папку
-                    self.save_generated_image(image_bytes, image_format, chat_id, "changelast")
-                    
-                    # Обновляем хранилище последних сгенерированных изображений
-                    self.last_generated_images[chat_id] = image_bytes
-                    
-                    # Создаем BytesIO объект из байтов
-                    image_file = BytesIO(image_bytes)
-                    image_file.name = f"modified_image.{image_format}"
-                    
-                    # Отправляем изображение как файл
-                    await update.message.reply_photo(
-                        photo=image_file,
-                        caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}"
-                    )
-                # Если это словарь с URL
-                elif 'url' in image_result:
-                    image_url = image_result['url']
-                    # Скачиваем изображение для сохранения
-                    try:
-                        response = requests.get(image_url, timeout=30)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            # Определяем формат по content-type
-                            content_type = response.headers.get('content-type', 'image/jpeg')
-                            image_format = content_type.split('/')[-1]
-                            
-                            # Сохраняем изображение
-                            self.save_generated_image(image_bytes, image_format, chat_id, "changelast")
-                            
-                            # Обновляем хранилище
-                            self.last_generated_images[chat_id] = image_bytes
-                    except Exception as e:
-                        logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                    
-                    # Отправляем URL
-                    await update.message.reply_photo(
-                        photo=image_url,
-                        caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}"
-                    )
-            else:
+            photo_sent = await self._deliver_ai_image_result(
+                update,
+                image_result,
+                caption=f"✨ **Изменённое изображение**\n\n📝 Запрос: {prompt}",
+                command_type="changelast",
+                file_basename="modified_image",
+            )
+            if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
             
             # Отслеживаем стоимость
@@ -1817,7 +1762,8 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при изменении последнего сгенерированного изображения: {e}")
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def mergeimage_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /mergeimage - обработка нескольких изображений"""
@@ -1835,6 +1781,7 @@ class TelegramWhisperBot:
         prompt = ' '.join(context.args)
         logger.info(f"Обработка нескольких изображений по запросу: {prompt}")
         
+        photo_sent = False
         try:
             # Получаем изображения из последнего сообщения
             chat_id = update.effective_chat.id
@@ -1901,56 +1848,26 @@ class TelegramWhisperBot:
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображения успешно обработаны!")
             
-            # Проверяем тип результата
-            if isinstance(result, dict):
-                # Если это сгенерированное изображение
-                if 'data' in result and 'format' in result:
-                    image_bytes = result['data']
-                    image_format = result['format']
-                    
-                    # Сохраняем изображение
-                    self.save_generated_image(image_bytes, image_format, chat_id, "mergeimage")
-                    
-                    # Сохраняем в хранилище последних сгенерированных
-                    self.last_generated_images[chat_id] = image_bytes
-                    
-                    # Отправляем изображение
-                    image_file = BytesIO(image_bytes)
-                    image_file.name = f"merged_image.{image_format}"
-                    
-                    await update.message.reply_photo(
-                        photo=image_file,
-                        caption=f"🔀 **Результат обработки {len(images_list)} изображений**\n\n📝 Запрос: {prompt}"
-                    )
-                # Если это URL изображения
-                elif 'url' in result:
-                    image_url = result['url']
-                    # Скачиваем изображение для сохранения
-                    try:
-                        response = requests.get(image_url, timeout=30)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            content_type = response.headers.get('content-type', 'image/jpeg')
-                            image_format = content_type.split('/')[-1]
-                            
-                            # Сохраняем изображение
-                            self.save_generated_image(image_bytes, image_format, chat_id, "mergeimage")
-                            self.last_generated_images[chat_id] = image_bytes
-                    except Exception as e:
-                        logger.warning(f"Не удалось скачать изображение для сохранения: {e}")
-                    
-                    await update.message.reply_photo(
-                        photo=image_url,
-                        caption=f"🔀 **Результат обработки {len(images_list)} изображений**\n\n📝 Запрос: {prompt}"
-                    )
-                # Если это текстовый ответ
-                elif 'description' in result:
-                    description = result['description']
-                    await self.send_ai_response(
-                        update.message, description,
-                        header=f"🔀 <b>Результат обработки {len(images_list)} изображений:</b>",
-                        continuation_header="Продолжение"
-                    )
+            if isinstance(result, dict) and 'description' in result:
+                description = result['description']
+                await self.send_ai_response(
+                    update.message, description,
+                    header=f"🔀 <b>Результат обработки {len(images_list)} изображений:</b>",
+                    continuation_header="Продолжение"
+                )
+            else:
+                photo_sent = await self._deliver_ai_image_result(
+                    update,
+                    result,
+                    caption=(
+                        f"🔀 **Результат обработки {len(images_list)} изображений**\n\n"
+                        f"📝 Запрос: {prompt}"
+                    ),
+                    command_type="mergeimage",
+                    file_basename="merged_image",
+                )
+                if not photo_sent:
+                    await self.update_status(processing_msg, "❌ Неизвестный формат результата.")
             
             # Отслеживаем стоимость
             if generation_id:
@@ -1963,7 +1880,8 @@ class TelegramWhisperBot:
             
         except Exception as e:
             logger.error(f"Ошибка при обработке нескольких изображений: {e}")
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /balance - проверка баланса OpenRouter"""
@@ -3184,6 +3102,7 @@ class TelegramWhisperBot:
         chat_id = update.effective_chat.id
         user = update.effective_user
 
+        photo_sent = False
         try:
             image_data = await self.get_last_image_from_chat(update, context, chat_id)
             if not image_data:
@@ -3243,18 +3162,25 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Не удалось собрать карту.")
                 return
 
-            self.save_generated_image(card_bytes, "png", chat_id, "mcg")
             self.last_images[chat_id] = card_bytes
 
             await self.update_status(processing_msg, "✅ Готово!")
             card_file = BytesIO(card_bytes)
             card_file.name = "mtg_card.png"
             caption = f"🃏 **{details.name}**\n{details.type_line}"
-            await update.message.reply_photo(photo=card_file, caption=caption, parse_mode='Markdown')
+            photo_sent = await self._reply_photo_safe(
+                update.message,
+                card_file,
+                caption,
+                parse_mode="Markdown",
+            )
+            if photo_sent:
+                await self._save_image_after_delivery(chat_id, "mcg", card_bytes, "png")
 
         except Exception as e:
             logger.error(f"MCG: ошибка: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
@@ -7037,6 +6963,10 @@ class TelegramWhisperBot:
                 .token(self.config["telegram_token"])
                 .base_url(tg_api["base_url"])
                 .base_file_url(tg_api["base_file_url"])
+                .connect_timeout(15)
+                .read_timeout(30)
+                .write_timeout(60)
+                .pool_timeout(10)
                 .build()
             )
             logger.info("Telegram Bot API: %s", tg_api["api_root"])
