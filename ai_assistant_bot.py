@@ -149,7 +149,16 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка при перезагрузке конфигурации: {e}")
             return False
-    
+
+    def get_telegram_api_config(self) -> dict:
+        """Базовый URL Telegram Bot API (прокси или api.telegram.org) → base_url / base_file_url для PTB."""
+        root = str(self.config.get("telegram_api_url", "https://api.telegram.org")).rstrip("/")
+        return {
+            "api_root": root,
+            "base_url": f"{root}/bot",
+            "base_file_url": f"{root}/file/bot",
+        }
+
     def init_database(self):
         """Инициализирует базу данных для статистики пользователей"""
         try:
@@ -7022,12 +7031,20 @@ class TelegramWhisperBot:
         """Запускает бота"""
         try:
             # Создаем приложение
-            self.application = Application.builder().token(self.config["telegram_token"]).build()
-            
+            tg_api = self.get_telegram_api_config()
+            self.application = (
+                Application.builder()
+                .token(self.config["telegram_token"])
+                .base_url(tg_api["base_url"])
+                .base_file_url(tg_api["base_file_url"])
+                .build()
+            )
+            logger.info("Telegram Bot API: %s", tg_api["api_root"])
+
             # Удаляем webhook, если он установлен
             try:
                 import requests
-                webhook_url = f"https://api.telegram.org/bot{self.config['telegram_token']}/deleteWebhook"
+                webhook_url = f"{tg_api['base_url']}{self.config['telegram_token']}/deleteWebhook"
                 requests.post(webhook_url, timeout=10)
                 logger.info("Webhook удален")
             except Exception as e:
