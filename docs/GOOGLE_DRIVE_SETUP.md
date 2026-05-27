@@ -23,27 +23,61 @@ Service Account **не имеет квоты** на Google Drive. При upload 
 2. **APIs & Services → Library**
 3. Найти **Google Drive API** → **Enable**
 
-### 2. OAuth consent screen
+### 2. Google Auth platform (OAuth consent)
 
-1. **APIs & Services → OAuth consent screen**
-2. User type: **External**
-3. Заполнить: App name, User support email, Developer contact email
-4. На шаге **Scopes** добавить (или оставить пустым — scope запросит setup-скрипт):
-   - `https://www.googleapis.com/auth/drive.file`
-5. **Publish app** → статус **In production**
+Google переименовал и перестроил этот раздел. Старый мастер «OAuth consent screen» с выбором **External** на первом экране больше не всегда показывается. Сейчас всё живёт в **Google Auth platform**.
 
-   Важно: в режиме **Testing** refresh token истекает через 7 дней. Для постоянной работы бота переведите app в **Production** (бесплатно, верификация для `drive.file` не нужна).
+**Как открыть:**
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → выберите проект
+2. Меню ☰ → **Google Auth platform**  
+   (если пункта нет: **APIs & Services → OAuth consent screen** — откроется тот же раздел)
+
+---
+
+#### Вариант A: первый раз («Google Auth platform not configured yet»)
+
+1. Нажмите **Get started**
+2. **App Information** — App name, User support email → **Next**
+3. **Audience** — здесь выбор типа аудитории:
+   - для личного `@gmail.com` выберите **External** (доступ любому Google-аккаунту)
+   - **Internal** бывает только у Google Workspace — у обычного Gmail его нет
+4. **Contact Information** — email разработчика → **Next**
+5. **Finish** — согласие с User Data Policy → **Continue** → **Create**
+
+После создания откроются вкладки/дашборды: **Branding**, **Audience**, **Data Access**, **Clients**.
+
+---
+
+#### Вариант B: уже настроено (видны только дашборды)
+
+Если мастера нет — платформа уже создана. Настройки по вкладкам:
+
+| Вкладка | Что сделать |
+|---------|-------------|
+| **Audience** | Статус публикации: **Publish app** → **In production** (см. ниже). В Testing refresh token живёт ~7 дней |
+| **Data Access** | **Add or remove scopes** → добавить `https://www.googleapis.com/auth/drive.file` → **Save** (можно и позже — scope запросит setup-скрипт) |
+| **Branding** | По желанию: имя приложения (не обязательно для личного бота) |
+
+**Publish app:** вкладка **Audience** → **Publishing status** → **Publish app**.  
+Для scope `drive.file` верификация Google **не нужна** — можно пользоваться с экраном «Unverified app» (Advanced → Continue).
+
+---
 
 ### 3. OAuth Client (Desktop app)
 
-1. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-2. Application type: **Desktop app**
-3. Скачать JSON
-4. Сохранить в корень проекта как:
+**Новый путь (предпочтительно):**
 
-   ```
-   google_oauth_client.json
-   ```
+1. **Google Auth platform → Clients**
+2. **Create client**
+3. Application type: **Desktop app**
+4. Скачать JSON → сохранить как `google_oauth_client.json` в корень проекта
+
+**Старый путь (если вкладки Clients нет):**
+
+1. **APIs & Services → Credentials**
+2. **Create Credentials → OAuth client ID**
+3. Application type: **Desktop app** → скачать JSON
 
 ---
 
