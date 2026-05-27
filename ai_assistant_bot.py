@@ -7137,7 +7137,21 @@ class TelegramWhisperBot:
                 )
             else:
                 logger.warning("JobQueue не доступен. Для периодического обновления моделей установите: pip install 'python-telegram-bot[job-queue]'")
-            
+
+            health_cfg = self.config.get("healthcheck", {})
+            if health_cfg.get("enabled", True):
+                from health_server import start_health_server
+
+                health_host = health_cfg.get("host", "0.0.0.0")
+                health_port = int(health_cfg.get("port", 18473))
+                health_path = health_cfg.get("path", "/healthz")
+                start_health_server(
+                    host=health_host,
+                    port=health_port,
+                    path=health_path,
+                    check_db=health_cfg.get("check_database", True),
+                )
+
             # Запускаем бота
             logger.info("Запускаю Telegram бота...")
             self.application.run_polling(
