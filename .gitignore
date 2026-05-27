@@ -14,6 +14,7 @@ MTGCardGenerator/
 config.json
 cookies.txt
 selected_models.json
+google_service_account.json
 # База данных статистики
 user_statistics.db
 

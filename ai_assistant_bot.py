@@ -11,8 +11,10 @@ import base64
 import mimetypes
 from urllib.parse import urlparse
 from io import BytesIO
-import sqlite3
 from datetime import datetime
+import database
+from psycopg import errors as pg_errors
+from drive_storage import DriveStorage
 
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -69,9 +71,13 @@ class TelegramWhisperBot:
         # Папка для сохранения сгенерированных изображений
         self.generated_images_dir = Path("generated_images")
         self.generated_images_dir.mkdir(exist_ok=True)
-        # База данных для статистики пользователей
-        self.db_path = "user_statistics.db"
+        # База данных PostgreSQL
+        database.configure(self.config.get("database", {}))
         self.init_database()
+        self.drive_storage = DriveStorage(
+            self.config.get("google_drive", {}),
+            project_root=Path(__file__).resolve().parent,
+        )
         # Список доступных моделей OpenRouter
         self.available_models = []
         # Файл для хранения выбранных моделей по chat_id
@@ -147,176 +153,10 @@ class TelegramWhisperBot:
     def init_database(self):
         """Инициализирует базу данных для статистики пользователей"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Создаем таблицу для хранения статистики пользователей
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_statistics (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    total_spent REAL DEFAULT 0,
-                    total_requests INTEGER DEFAULT 0,
-                    last_request_date TEXT,
-                    created_at TEXT
-                )
-            ''')
-            
-            # Создаем таблицу для детальной истории запросов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS request_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    generation_id TEXT,
-                    command TEXT,
-                    cost REAL,
-                    model TEXT,
-                    tokens_prompt INTEGER,
-                    tokens_completion INTEGER,
-                    request_date TEXT,
-                    FOREIGN KEY (user_id) REFERENCES user_statistics (user_id)
-                )
-            ''')
-            
-            # Турнирные таблицы
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournament_registrations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tournament_id TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    username TEXT,
-                    fighter_name TEXT NOT NULL,
-                    registered_at TEXT NOT NULL,
-                    disqualified INTEGER DEFAULT 0,
-                    validated INTEGER DEFAULT 0,
-                    UNIQUE(tournament_id, user_id)
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournament_bans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fighter_name TEXT NOT NULL,
-                    banned_at TEXT NOT NULL,
-                    tournament_id TEXT
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournaments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tournament_id TEXT UNIQUE NOT NULL,
-                    status TEXT DEFAULT 'registration',
-                    bracket_json TEXT,
-                    created_at TEXT,
-                    completed_at TEXT
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournament_scores (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    total_points INTEGER DEFAULT 0,
-                    first_places INTEGER DEFAULT 0,
-                    second_places INTEGER DEFAULT 0,
-                    semifinal_places INTEGER DEFAULT 0
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS steam_games (
-                    appid INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    last_modified INTEGER,
-                    updated_at TEXT
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS steam_user_wishlist (
-                    steamid TEXT NOT NULL,
-                    appid INTEGER NOT NULL,
-                    updated_at TEXT,
-                    PRIMARY KEY (steamid, appid)
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS steam_user_owned (
-                    steamid TEXT NOT NULL,
-                    appid INTEGER NOT NULL,
-                    updated_at TEXT,
-                    PRIMARY KEY (steamid, appid)
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS quiz_scores (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    total_points INTEGER DEFAULT 0,
-                    correct_answers INTEGER DEFAULT 0,
-                    quizzes_played INTEGER DEFAULT 0,
-                    last_played_at TEXT
-                )
-            ''')
-
-            self._migrate_columns(conn)
-            conn.commit()
-            conn.close()
+            database.init_database()
             logger.info("База данных статистики успешно инициализирована")
         except Exception as e:
             logger.error(f"Ошибка при инициализации базы данных: {e}")
-
-    def _migrate_columns(self, conn: sqlite3.Connection):
-        """Добавляет недостающие колонки в существующие таблицы (безопасный ALTER TABLE).
-        Вызывается автоматически при каждом старте бота — не трогает уже существующие колонки."""
-        expected = {
-            "user_statistics": [
-                ("total_spent",       "REAL    DEFAULT 0"),
-                ("total_requests",    "INTEGER DEFAULT 0"),
-                ("last_request_date", "TEXT"),
-                ("created_at",        "TEXT"),
-            ],
-            "request_history": [
-                ("generation_id",     "TEXT"),
-                ("tokens_prompt",     "INTEGER"),
-                ("tokens_completion", "INTEGER"),
-            ],
-            "tournament_scores": [
-                ("first_places",     "INTEGER DEFAULT 0"),
-                ("second_places",    "INTEGER DEFAULT 0"),
-                ("semifinal_places", "INTEGER DEFAULT 0"),
-            ],
-            "tournament_registrations": [
-                ("disqualified", "INTEGER DEFAULT 0"),
-                ("validated", "INTEGER DEFAULT 0"),
-            ],
-            "tournaments": [
-                ("bracket_json",  "TEXT"),
-                ("completed_at",  "TEXT"),
-            ],
-        }
-        cursor = conn.cursor()
-        for table, columns in expected.items():
-            try:
-                cursor.execute(f"PRAGMA table_info({table})")
-                existing = {row[1] for row in cursor.fetchall()}
-                if not existing:
-                    # Таблица ещё не создана — пропускаем, CREATE TABLE IF NOT EXISTS создаст её выше
-                    continue
-                for col_name, col_def in columns:
-                    if col_name not in existing:
-                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
-                        logger.info(f"Миграция БД: добавлена колонка {table}.{col_name}")
-            except Exception as e:
-                logger.error(f"Миграция БД: ошибка при обработке таблицы {table}: {e}")
-        conn.commit()
 
     def load_selected_models(self) -> dict:
         """Загружает выбранные модели из файла"""
@@ -497,7 +337,7 @@ class TelegramWhisperBot:
             current_time = datetime.now().isoformat()
             rows = [(appid, name, last_mod, current_time) for appid, name, last_mod in collected.values()]
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             try:
                 cursor = conn.cursor()
                 cursor.execute("BEGIN")
@@ -579,7 +419,7 @@ class TelegramWhisperBot:
         # Дедупликация на случай дублей в ответе API
         unique_appids = sorted(set(int(a) for a in appids))
         rows = [(steamid, appid, now) for appid in unique_appids]
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         try:
             cursor = conn.cursor()
             cursor.execute("BEGIN")
@@ -717,7 +557,7 @@ class TelegramWhisperBot:
             tokens_completion: Количество токенов в ответе
         """
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             
             current_time = datetime.now().isoformat()
@@ -850,29 +690,29 @@ class TelegramWhisperBot:
         return s
 
     def save_generated_image(self, image_bytes: bytes, image_format: str, chat_id: int, command_type: str) -> Path:
-        """Сохраняет сгенерированное изображение в папку
-        
+        """Сохраняет сгенерированное изображение локально и в Google Drive (если включено).
+
         Args:
             image_bytes: Байты изображения
             image_format: Формат изображения (png, jpeg, etc.)
             chat_id: ID чата
             command_type: Тип команды (imagegen, imagechange, changelast)
-        
+
         Returns:
-            Path: Путь к сохранённому файлу
+            Path: Путь к локально сохранённому файлу
         """
-        from datetime import datetime
-        
-        # Создаем имя файла с временной меткой
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{command_type}_{chat_id}_{timestamp}.{image_format}"
         filepath = self.generated_images_dir / filename
-        
-        # Сохраняем файл
-        with open(filepath, 'wb') as f:
+
+        with open(filepath, "wb") as f:
             f.write(image_bytes)
-        
-        logger.info(f"Сгенерированное изображение сохранено: {filepath}")
+
+        logger.info(f"Сгенерированное изображение сохранено локально: {filepath}")
+
+        mime_type, _ = mimetypes.guess_type(filename)
+        self.drive_storage.upload_file(filename, image_bytes, mime_type)
+
         return filepath
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2188,7 +2028,7 @@ class TelegramWhisperBot:
             return
         
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             
             # Получаем статистику пользователей, отсортированную по расходам
@@ -2359,7 +2199,7 @@ class TelegramWhisperBot:
             oleg = str(oleg_raw).strip() if oleg_raw is not None else ""
 
             extra_lines: list = []
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             try:
                 cursor = conn.cursor()
                 cursor.execute("SELECT appid, name FROM steam_games ORDER BY RANDOM() LIMIT 1")
@@ -2651,7 +2491,7 @@ class TelegramWhisperBot:
         if not state.get("scores"):
             return
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             try:
                 cursor = conn.cursor()
                 now = datetime.now().isoformat()
@@ -3151,7 +2991,7 @@ class TelegramWhisperBot:
             await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
             return
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             try:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -5469,7 +5309,7 @@ class TelegramWhisperBot:
 
     def _get_current_tournament_id(self) -> str:
         """Возвращает ID текущего/последнего активного турнира (YYYY-MM-DD понедельника)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT tournament_id FROM tournaments WHERE status IN ('registration','active') ORDER BY id DESC LIMIT 1"
@@ -5480,7 +5320,7 @@ class TelegramWhisperBot:
 
     def _get_tournament_status(self, tournament_id: str) -> str:
         """Возвращает статус турнира или None если турнира нет."""
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         cursor = conn.cursor()
         cursor.execute("SELECT status FROM tournaments WHERE tournament_id = ?", (tournament_id,))
         row = cursor.fetchone()
@@ -5501,7 +5341,7 @@ class TelegramWhisperBot:
                 logger.error("tournament_channel_id не задан в config.json")
                 return
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
 
             # Check existing tournament state:
@@ -5619,7 +5459,7 @@ class TelegramWhisperBot:
             await update.message.reply_text("⚔️ Регистрация на этот турнир уже закрыта.")
             return
 
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT disqualified, fighter_name FROM tournament_registrations "
@@ -5675,7 +5515,7 @@ class TelegramWhisperBot:
 
         now_iso = datetime.now().isoformat()
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             if re_register:
                 cursor.execute(
@@ -5718,9 +5558,9 @@ class TelegramWhisperBot:
                 parse_mode='HTML'
             )
             logger.info(f"Пользователь {username} ({user_id}) зарегистрировал бойца '{fighter_name}' на турнир {tournament_id}")
-        except sqlite3.IntegrityError:
+        except pg_errors.UniqueViolation:
             # Уже зарегистрирован — показываем текущего бойца
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT fighter_name FROM tournament_registrations WHERE tournament_id=? AND user_id=?",
@@ -5901,7 +5741,7 @@ class TelegramWhisperBot:
                 logger.info(f"Ежедневная проверка: турнир {tournament_id} не в фазе регистрации ({status}) — пропуск")
                 return
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT user_id, username, fighter_name FROM tournament_registrations "
@@ -5920,7 +5760,7 @@ class TelegramWhisperBot:
                 for r in rows
             ]
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute("SELECT fighter_name FROM tournament_bans")
             bans = [r[0] for r in cursor.fetchall()]
@@ -5928,7 +5768,7 @@ class TelegramWhisperBot:
 
             dq_results = await self.validate_participants_with_ai(participants, bans)
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             dq_lines = []
             for uid, reason in dq_results:
@@ -6420,7 +6260,7 @@ class TelegramWhisperBot:
 
     def _save_bracket(self, tournament_id: str, bracket: dict):
         """Сохраняет сетку в БД."""
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE tournaments SET bracket_json=? WHERE tournament_id=?",
@@ -6431,7 +6271,7 @@ class TelegramWhisperBot:
 
     def _load_bracket(self, tournament_id: str) -> dict:
         """Загружает сетку из БД."""
-        conn = sqlite3.connect(self.db_path)
+        conn = database.connect()
         cursor = conn.cursor()
         cursor.execute("SELECT bracket_json FROM tournaments WHERE tournament_id=?", (tournament_id,))
         row = cursor.fetchone()
@@ -6463,7 +6303,7 @@ class TelegramWhisperBot:
                 )
 
             # Закрываем регистрацию
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE tournaments SET status='validation' WHERE tournament_id=?",
@@ -6500,7 +6340,7 @@ class TelegramWhisperBot:
                     text="❌ <b>Турнир отменён</b> — недостаточно участников (нужно минимум 2).",
                     parse_mode='HTML'
                 )
-                conn = sqlite3.connect(self.db_path)
+                conn = database.connect()
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE tournaments SET status='cancelled' WHERE tournament_id=?",
@@ -6511,7 +6351,7 @@ class TelegramWhisperBot:
                 return
 
             # Получаем банлист
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute("SELECT fighter_name FROM tournament_bans")
             bans = [r[0] for r in cursor.fetchall()]
@@ -6522,7 +6362,7 @@ class TelegramWhisperBot:
             if unvalidated:
                 dq_results = await self.validate_participants_with_ai(unvalidated, bans)
 
-                conn = sqlite3.connect(self.db_path)
+                conn = database.connect()
                 cursor = conn.cursor()
                 for uid, _ in dq_results:
                     cursor.execute(
@@ -6567,7 +6407,7 @@ class TelegramWhisperBot:
                     text="❌ <b>Турнир отменён</b> — после дисквалификаций осталось меньше 2 участников.",
                     parse_mode='HTML'
                 )
-                conn = sqlite3.connect(self.db_path)
+                conn = database.connect()
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE tournaments SET status='cancelled' WHERE tournament_id=?",
@@ -6581,7 +6421,7 @@ class TelegramWhisperBot:
             bracket = self.build_bracket(participants)
             self._save_bracket(tournament_id, bracket)
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE tournaments SET status='active' WHERE tournament_id=?",
@@ -6846,7 +6686,7 @@ class TelegramWhisperBot:
             third = top3[2] if len(top3) > 2 else None
 
             def update_score(user_id, username, points, field):
-                conn = sqlite3.connect(self.db_path)
+                conn = database.connect()
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO tournament_scores (user_id, username, total_points, first_places, second_places, semifinal_places) "
@@ -6869,7 +6709,7 @@ class TelegramWhisperBot:
             if third and third.get("user_id"):
                 update_score(third["user_id"], third.get("username", ""), 1, "semifinal_places")
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             now_iso = datetime.now().isoformat()
             for p in top3:
@@ -6940,7 +6780,7 @@ class TelegramWhisperBot:
                 )
                 return
 
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT user_id, username FROM tournament_registrations "
@@ -6975,7 +6815,7 @@ class TelegramWhisperBot:
     async def banlist_command(self, update, context):
         """Показывает список забаненных бойцов."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT fighter_name, tournament_id, banned_at FROM tournament_bans ORDER BY banned_at DESC"
@@ -7005,7 +6845,7 @@ class TelegramWhisperBot:
     async def leaderboard_command(self, update, context):
         """Показывает таблицу лидеров по турнирным очкам."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = database.connect()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT user_id, username, total_points, first_places, second_places, semifinal_places "
