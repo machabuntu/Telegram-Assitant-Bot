@@ -23,9 +23,9 @@ text:
   paragraph_gap: 14
 
 rarity_symbol:
-  size: 120
+  size: 90
   right: 1370
-  y_offset: -6
+  y_offset: 10
 
 footer:
   left_x: 100
@@ -57,12 +57,12 @@ standard:
   rules:
     box: [129, 1323, 1242, 604]
     font: timesnewroman
-    max_size: 58
+    max_size: 45
     min_size: 20
   flavor:
     font: timesnewromanitalic
-    max_size: 60
-    min_size: 50
+    max_size: 45
+    min_size: 30
   pt:
     box_pos: [1136, 1858]
     text_center: [1292, 1915]
