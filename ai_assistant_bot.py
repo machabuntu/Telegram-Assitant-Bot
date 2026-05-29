@@ -2392,6 +2392,28 @@ class TelegramWhisperBot:
             return username
         return f"id{info.get('user_id', '?')}"
 
+    def _quiz_format_accepted_answers(self, answers: list) -> tuple[str, str]:
+        """Возвращает (метка, HTML-текст) для списка принятых ответов."""
+        import html as html_module
+
+        clean = [a.strip() for a in answers if isinstance(a, str) and a.strip()]
+        if not clean:
+            return ("Правильный ответ", "?")
+        escaped = [html_module.escape(a) for a in clean]
+        if len(clean) == 1:
+            return ("Правильный ответ", f"<b>{escaped[0]}</b>")
+        joined = ", ".join(f"<b>{a}</b>" for a in escaped)
+        return ("Правильные ответы", joined)
+
+    def _quiz_format_accepted_answers_plain(self, answers: list) -> tuple[str, str]:
+        """Возвращает (метка, plain text) для списка принятых ответов."""
+        clean = [a.strip() for a in answers if isinstance(a, str) and a.strip()]
+        if not clean:
+            return ("Правильный ответ", "?")
+        if len(clean) == 1:
+            return ("Правильный ответ", clean[0])
+        return ("Правильные ответы", ", ".join(clean))
+
     def _quiz_award_points(self, state: dict, user, points: int):
         """Начисляет очки игроку в рамках текущей сессии."""
         user_id = user.id
@@ -2514,11 +2536,11 @@ class TelegramWhisperBot:
                 "first_name": user.first_name or "",
                 "last_name": user.last_name or "",
             })
-            main_answer = answers[0] if answers else "?"
+            label, answers_html = self._quiz_format_accepted_answers(answers)
             try:
                 await update.message.reply_text(
                     f"✅ <b>{display}</b> ответил(а) правильно! +{points} оч.\n"
-                    f"Правильный ответ: <b>{main_answer}</b>",
+                    f"{label}: {answers_html}",
                     parse_mode='HTML'
                 )
             except Exception as e:
@@ -2602,18 +2624,20 @@ class TelegramWhisperBot:
         state["awaiting_answer"] = False
         try:
             q = state["questions"][qindex]
-            main_answer = (q.get("answers") or ["?"])[0]
+            answers = q.get("answers") or []
+            label, answers_html = self._quiz_format_accepted_answers(answers)
+            label_plain, answers_plain = self._quiz_format_accepted_answers_plain(answers)
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⏱ Время вышло! Правильный ответ: <b>{main_answer}</b>",
+                    text=f"⏱ Время вышло! {label}: {answers_html}",
                     parse_mode='HTML',
                     reply_to_message_id=state.get("question_msg_id"),
                 )
             except Exception:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⏱ Время вышло! Правильный ответ: {main_answer}",
+                    text=f"⏱ Время вышло! {label_plain}: {answers_plain}",
                 )
             logger.info(f"Quiz chat={chat_id}: таймаут на вопросе {qindex + 1}")
         except Exception as e:
