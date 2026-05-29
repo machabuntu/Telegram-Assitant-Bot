@@ -5,14 +5,19 @@ from __future__ import annotations
 import io
 import logging
 import mimetypes
+import ssl
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 DRIVE_SCOPES = [DRIVE_SCOPE]
 FOLDER_MIME = "application/vnd.google-apps.folder"
+UPLOAD_CHUNK_SIZE = 256 * 1024
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_RETRY_BASE_DELAY = 2.0
 
 
 def resolve_project_path(project_root: Path, raw: str) -> Path:
@@ -78,9 +83,39 @@ def load_oauth_credentials(
 
 
 def build_drive_service(credentials):
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
 
-    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+    http = httplib2.Http(timeout=120)
+    authorized_http = AuthorizedHttp(credentials, http=http)
+    return build("drive", "v3", http=authorized_http, cache_discovery=False)
+
+
+def _is_retryable_upload_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ssl.SSLError, ConnectionError, ConnectionResetError, BrokenPipeError)):
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "eof occurred",
+            "connection reset",
+            "broken pipe",
+            "timed out",
+            "temporary failure",
+            "server disconnected",
+        )
+    )
+
+
+def _execute_resumable_upload(request) -> dict:
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            logger.debug("Google Drive upload progress: %.0f%%", status.progress() * 100)
+    return response
 
 
 def create_gallery_folder(service, folder_name: str) -> str:
@@ -126,7 +161,17 @@ class DriveStorage:
         self._service = build_drive_service(credentials)
         return self._service
 
-    def upload_file(self, filename: str, data: bytes, mime_type: Optional[str] = None) -> Optional[str]:
+    def _reset_service(self) -> None:
+        self._service = None
+
+    def upload_file(
+        self,
+        filename: str,
+        data: Optional[bytes] = None,
+        mime_type: Optional[str] = None,
+        *,
+        filepath: Optional[Union[Path, str]] = None,
+    ) -> Optional[str]:
         if not self.enabled:
             return None
 
@@ -140,25 +185,72 @@ class DriveStorage:
             )
             return None
 
+        if filepath is not None:
+            source_path = Path(filepath)
+            if not source_path.is_file():
+                logger.error("Google Drive upload skipped: file not found: %s", source_path)
+                return None
+        elif data is not None:
+            source_path = None
+        else:
+            logger.error("Google Drive upload skipped: neither data nor filepath provided")
+            return None
+
         if not mime_type:
             mime_type, _ = mimetypes.guess_type(filename)
         mime_type = mime_type or "application/octet-stream"
 
-        try:
-            service = self._get_service()
-            metadata = {"name": filename, "parents": [folder_id]}
-            media = io.BytesIO(data)
-            from googleapiclient.http import MediaIoBaseUpload
+        metadata = {"name": filename, "parents": [folder_id]}
+        last_error: Optional[Exception] = None
 
-            upload = MediaIoBaseUpload(media, mimetype=mime_type, resumable=False)
-            result = (
-                service.files()
-                .create(body=metadata, media_body=upload, fields="id,name")
-                .execute()
-            )
-            file_id = result.get("id")
-            logger.info("Uploaded to Google Drive: %s (file_id=%s)", filename, file_id)
-            return file_id
-        except Exception as e:
-            logger.error("Google Drive upload failed for %s: %s", filename, e, exc_info=True)
-            return None
+        for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+            try:
+                from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+
+                service = self._get_service()
+                if source_path is not None:
+                    media = MediaFileUpload(
+                        str(source_path),
+                        mimetype=mime_type,
+                        resumable=True,
+                        chunksize=UPLOAD_CHUNK_SIZE,
+                    )
+                else:
+                    media = MediaIoBaseUpload(
+                        io.BytesIO(data),
+                        mimetype=mime_type,
+                        resumable=True,
+                        chunksize=UPLOAD_CHUNK_SIZE,
+                    )
+
+                request = service.files().create(
+                    body=metadata,
+                    media_body=media,
+                    fields="id,name",
+                )
+                result = _execute_resumable_upload(request)
+                file_id = result.get("id")
+                logger.info("Uploaded to Google Drive: %s (file_id=%s)", filename, file_id)
+                return file_id
+            except Exception as e:
+                last_error = e
+                if attempt >= UPLOAD_MAX_RETRIES or not _is_retryable_upload_error(e):
+                    break
+                delay = UPLOAD_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "Google Drive upload attempt %s/%s failed for %s: %s; retry in %.1fs",
+                    attempt,
+                    UPLOAD_MAX_RETRIES,
+                    filename,
+                    e,
+                )
+                self._reset_service()
+                time.sleep(delay)
+
+        logger.error(
+            "Google Drive upload failed for %s: %s",
+            filename,
+            last_error,
+            exc_info=last_error,
+        )
+        return None

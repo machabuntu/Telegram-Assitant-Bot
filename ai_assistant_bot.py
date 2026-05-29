@@ -721,7 +721,7 @@ class TelegramWhisperBot:
         logger.info(f"Сгенерированное изображение сохранено локально: {filepath}")
 
         mime_type, _ = mimetypes.guess_type(filename)
-        self.drive_storage.upload_file(filename, image_bytes, mime_type)
+        self.drive_storage.upload_file(filename, mime_type=mime_type, filepath=filepath)
 
         return filepath
     
