@@ -494,147 +494,6 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Ошибка в фоновой задаче обновления Steam: {e}", exc_info=True)
 
-    async def track_generation_cost(self, generation_id: str, user_id: int, username: str, 
-                                     first_name: str, last_name: str, command: str):
-        """Отслеживает стоимость генерации и обновляет статистику пользователя
-        
-        Args:
-            generation_id: ID генерации из OpenRouter
-            user_id: Telegram user ID
-            username: Telegram username
-            first_name: Имя пользователя
-            last_name: Фамилия пользователя
-            command: Команда, которая была использована
-        """
-        try:
-            # Получаем конфигурацию OpenRouter (используем describe_api для совместимости)
-            api_config = self.get_api_config("describe_api")
-            
-            # Запрашиваем метаданные генерации
-            url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
-            headers = {
-                "Authorization": f"Bearer {api_config['key']}"
-            }
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"Метаданные генерации {generation_id}: {self._format_api_result_for_log(result)}")
-                
-                data = result.get("data", {})
-                total_cost = data.get("total_cost", 0)
-                model = data.get("model", "unknown")
-                tokens_prompt = data.get("tokens_prompt", 0)
-                tokens_completion = data.get("tokens_completion", 0)
-                
-                # Сохраняем статистику
-                self.save_user_statistics(
-                    user_id=user_id,
-                    username=username,
-                    first_name=first_name,
-                    last_name=last_name,
-                    cost=total_cost,
-                    generation_id=generation_id,
-                    command=command,
-                    model=model,
-                    tokens_prompt=tokens_prompt,
-                    tokens_completion=tokens_completion
-                )
-                
-                logger.info(f"Стоимость запроса пользователя {username} (ID: {user_id}): ${total_cost:.6f}")
-            else:
-                logger.warning(f"Не удалось получить метаданные генерации {generation_id}: {response.status_code}")
-                
-        except Exception as e:
-            logger.error(f"Ошибка при отслеживании стоимости генерации: {e}")
-    
-    def save_user_statistics(self, user_id: int, username: str, first_name: str, last_name: str,
-                            cost: float, generation_id: str, command: str, model: str,
-                            tokens_prompt: int, tokens_completion: int):
-        """Сохраняет статистику использования пользователем
-        
-        Args:
-            user_id: Telegram user ID
-            username: Telegram username
-            first_name: Имя пользователя
-            last_name: Фамилия пользователя
-            cost: Стоимость запроса
-            generation_id: ID генерации
-            command: Использованная команда
-            model: Модель, которая использовалась
-            tokens_prompt: Количество токенов в промпте
-            tokens_completion: Количество токенов в ответе
-        """
-        try:
-            conn = database.connect()
-            cursor = conn.cursor()
-            
-            current_time = datetime.now().isoformat()
-            
-            # Проверяем, существует ли пользователь
-            cursor.execute('SELECT user_id FROM user_statistics WHERE user_id = ?', (user_id,))
-            exists = cursor.fetchone()
-            
-            if exists:
-                # Обновляем существующую запись
-                cursor.execute('''
-                    UPDATE user_statistics 
-                    SET username = ?,
-                        first_name = ?,
-                        last_name = ?,
-                        total_spent = total_spent + ?,
-                        total_requests = total_requests + 1,
-                        last_request_date = ?
-                    WHERE user_id = ?
-                ''', (username, first_name, last_name, cost, current_time, user_id))
-            else:
-                # Создаем новую запись
-                cursor.execute('''
-                    INSERT INTO user_statistics 
-                    (user_id, username, first_name, last_name, total_spent, total_requests, 
-                     last_request_date, created_at)
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                ''', (user_id, username, first_name, last_name, cost, current_time, current_time))
-            
-            # Добавляем запись в историю
-            cursor.execute('''
-                INSERT INTO request_history 
-                (user_id, generation_id, command, cost, model, tokens_prompt, 
-                 tokens_completion, request_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, generation_id, command, cost, model, tokens_prompt, 
-                  tokens_completion, current_time))
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Статистика пользователя {user_id} обновлена: +${cost:.6f}")
-            
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении статистики: {e}")
-    
-    def get_generation_id_from_response(self, response_data: dict) -> Optional[str]:
-        """Извлекает generation ID из ответа OpenRouter API
-        
-        Args:
-            response_data: JSON ответ от OpenRouter API
-            
-        Returns:
-            str: ID генерации или None
-        """
-        try:
-            # ID генерации обычно находится в поле 'id'
-            generation_id = response_data.get('id')
-            if generation_id:
-                logger.info(f"Извлечен generation_id: {generation_id}")
-                return generation_id
-            else:
-                logger.warning("generation_id не найден в ответе API")
-                return None
-        except Exception as e:
-            logger.error(f"Ошибка при извлечении generation_id: {e}")
-            return None
-
     def _sanitize_for_log(self, obj, depth: int = 0):
         """Убирает из структуры data:image...;base64,... и гигантские base64-строки для безопасного логирования."""
         if depth > 24:
@@ -755,9 +614,8 @@ class TelegramWhisperBot:
             "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
             "🃏 **MTG-карты:**\n"
             "• `/mcg` - генерация MTG-карты из последнего изображения в чате\n\n"
-            "💰 **Баланс и статистика:**\n"
-            "• `/balance` - проверка остатка средств на OpenRouter\n"
-            "• `/statistics` - статистика расходов пользователей\n\n"
+            "💰 **Баланс:**\n"
+            "• `/balance` - проверка остатка средств на OpenRouter\n\n"
             "⚙️ **Управление:**\n"
             "• `/reload` - перезагрузка конфигурации без перезапуска бота\n\n"
             "Выберите нужную команду для начала работы!"
@@ -1009,25 +867,8 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при анализе изображения.")
                 return
             
-            # Обрабатываем результат (может быть tuple или str)
-            description = None
-            generation_id = None
-            
-            if isinstance(result, tuple) and len(result) == 2:
-                # OpenRouter возвращает (description, generation_id)
-                description, generation_id = result
-            else:
-                # Grok возвращает только description
-                description = result
-            
-            # Отслеживаем стоимость для OpenRouter
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "describe")
+            # Обрабатываем результат
+            description = result
             
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
@@ -1115,16 +956,7 @@ class TelegramWhisperBot:
                 return
             
             # Обрабатываем результат
-            response_text, generation_id = result
-            
-            # Отслеживаем стоимость для OpenRouter
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "ask")
+            response_text = result
             
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
@@ -1402,16 +1234,7 @@ class TelegramWhisperBot:
                 return
             
             # Обрабатываем результат
-            response_text, generation_id = result
-            
-            # Отслеживаем стоимость для OpenRouter
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "askmodel")
+            response_text = result
             
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Готово!")
@@ -1459,22 +1282,9 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при генерации изображения.")
                 return
             
-            # Извлекаем generation_id для отслеживания стоимости (даже при ошибке)
-            generation_id = None
-            if isinstance(image_result, dict) and 'generation_id' in image_result:
-                generation_id = image_result['generation_id']
-            
             # Проверяем на ошибку
             if isinstance(image_result, dict) and 'error' in image_result:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
-                # Отслеживаем стоимость даже при ошибке
-                if generation_id:
-                    user = update.effective_user
-                    user_id = user.id
-                    username = user.username or ""
-                    first_name = user.first_name or ""
-                    last_name = user.last_name or ""
-                    await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "imagegen")
                 return
             
             # Отправляем результат
@@ -1489,15 +1299,6 @@ class TelegramWhisperBot:
             )
             if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
-            
-            # Отслеживаем стоимость
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "imagegen")
             
         except Exception as e:
             logger.error(f"Ошибка при генерации изображения: {e}")
@@ -1537,22 +1338,9 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при генерации азбуки.")
                 return
             
-            # Извлекаем generation_id для отслеживания стоимости (даже при ошибке)
-            generation_id = None
-            if isinstance(image_result, dict) and 'generation_id' in image_result:
-                generation_id = image_result['generation_id']
-            
             # Проверяем на ошибку
             if isinstance(image_result, dict) and 'error' in image_result:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
-                # Отслеживаем стоимость даже при ошибке
-                if generation_id:
-                    user = update.effective_user
-                    user_id = user.id
-                    username = user.username or ""
-                    first_name = user.first_name or ""
-                    last_name = user.last_name or ""
-                    await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "abcgen")
                 return
             
             # Отправляем результат
@@ -1567,15 +1355,6 @@ class TelegramWhisperBot:
             )
             if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
-            
-            # Отслеживаем стоимость успешного запроса
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "abcgen")
             
         except Exception as e:
             logger.error(f"Ошибка при генерации азбуки: {e}")
@@ -1629,22 +1408,9 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при изменении изображения.")
                 return
             
-            # Извлекаем generation_id для отслеживания стоимости (даже при ошибке)
-            generation_id = None
-            if isinstance(image_result, dict) and 'generation_id' in image_result:
-                generation_id = image_result['generation_id']
-            
             # Проверяем на ошибку
             if isinstance(image_result, dict) and 'error' in image_result:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
-                # Отслеживаем стоимость даже при ошибке
-                if generation_id:
-                    user = update.effective_user
-                    user_id = user.id
-                    username = user.username or ""
-                    first_name = user.first_name or ""
-                    last_name = user.last_name or ""
-                    await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "imagechange")
                 return
             
             # Отправляем результат
@@ -1659,15 +1425,6 @@ class TelegramWhisperBot:
             )
             if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
-            
-            # Отслеживаем стоимость
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "imagechange")
             
         except Exception as e:
             logger.error(f"Ошибка при изменении изображения: {e}")
@@ -1720,22 +1477,9 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при изменении изображения.")
                 return
             
-            # Извлекаем generation_id для отслеживания стоимости (даже при ошибке)
-            generation_id = None
-            if isinstance(image_result, dict) and 'generation_id' in image_result:
-                generation_id = image_result['generation_id']
-            
             # Проверяем на ошибку
             if isinstance(image_result, dict) and 'error' in image_result:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
-                # Отслеживаем стоимость даже при ошибке
-                if generation_id:
-                    user = update.effective_user
-                    user_id = user.id
-                    username = user.username or ""
-                    first_name = user.first_name or ""
-                    last_name = user.last_name or ""
-                    await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "changelast")
                 return
             
             # Отправляем результат
@@ -1750,15 +1494,6 @@ class TelegramWhisperBot:
             )
             if not photo_sent:
                 await self.update_status(processing_msg, "❌ Неизвестный формат изображения.")
-            
-            # Отслеживаем стоимость
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "changelast")
             
         except Exception as e:
             logger.error(f"Ошибка при изменении последнего сгенерированного изображения: {e}")
@@ -1827,22 +1562,9 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, "❌ Ошибка при обработке изображений.")
                 return
             
-            # Извлекаем generation_id для отслеживания стоимости (даже при ошибке)
-            generation_id = None
-            if isinstance(result, dict) and 'generation_id' in result:
-                generation_id = result['generation_id']
-            
             # Проверяем на ошибку
             if isinstance(result, dict) and 'error' in result:
                 await self.update_status(processing_msg, f"❌ {result['error']}")
-                # Отслеживаем стоимость даже при ошибке
-                if generation_id:
-                    user = update.effective_user
-                    user_id = user.id
-                    username = user.username or ""
-                    first_name = user.first_name or ""
-                    last_name = user.last_name or ""
-                    await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "mergeimage")
                 return
             
             # Отправляем результат
@@ -1868,15 +1590,6 @@ class TelegramWhisperBot:
                 )
                 if not photo_sent:
                     await self.update_status(processing_msg, "❌ Неизвестный формат результата.")
-            
-            # Отслеживаем стоимость
-            if generation_id:
-                user = update.effective_user
-                user_id = user.id
-                username = user.username or ""
-                first_name = user.first_name or ""
-                last_name = user.last_name or ""
-                await self.track_generation_cost(generation_id, user_id, username, first_name, last_name, "mergeimage")
             
         except Exception as e:
             logger.error(f"Ошибка при обработке нескольких изображений: {e}")
@@ -1944,123 +1657,6 @@ class TelegramWhisperBot:
         except Exception as e:
             logger.error(f"Неожиданная ошибка при проверке баланса: {e}")
             await update.message.reply_text(f"❌ Произошла неожиданная ошибка: {str(e)}")
-    
-    async def statistics_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /statistics - показывает статистику расходов пользователей"""
-        # Проверяем, что сообщение пришло из разрешенного канала
-        if not self.is_authorized_channel(update):
-            await update.message.reply_text(
-                "❌ Эта команда доступна только в авторизованном канале."
-            )
-            return
-        
-        try:
-            conn = database.connect()
-            cursor = conn.cursor()
-            
-            # Получаем статистику пользователей, отсортированную по расходам
-            cursor.execute('''
-                SELECT user_id, username, first_name, last_name, total_spent, total_requests
-                FROM user_statistics
-                ORDER BY total_spent DESC
-            ''')
-            
-            users = cursor.fetchall()
-            conn.close()
-            
-            if not users:
-                await update.message.reply_text(
-                    "📊 <b>Статистика использования</b>\n\n"
-                    "Пока нет данных о расходах.",
-                    parse_mode='HTML'
-                )
-                return
-            
-            # Формируем сообщение со статистикой
-            message_parts = ["📊 <b>Статистика расходов пользователей</b>\n"]
-            
-            total_all_users = 0
-            for idx, (user_id, username, first_name, last_name, total_spent, total_requests) in enumerate(users, 1):
-                total_all_users += total_spent
-                
-                # Формируем имя пользователя (приоритет username)
-                display_name = ""
-                if username:
-                    display_name = f"@{username}"
-                elif first_name:
-                    display_name = first_name
-                    if last_name:
-                        display_name += f" {last_name}"
-                else:
-                    display_name = f"User {user_id}"
-                
-                # Добавляем эмодзи для топ-3
-                medal = ""
-                if idx == 1:
-                    medal = "🥇 "
-                elif idx == 2:
-                    medal = "🥈 "
-                elif idx == 3:
-                    medal = "🥉 "
-                
-                # Всё в одну строку
-                message_parts.append(
-                    f"\n{medal}<b>{idx}.</b> {display_name} • ${total_spent:.4f} • {total_requests} запросов"
-                )
-            
-            # Добавляем общую сумму
-            message_parts.append(
-                f"\n\n💵 <b>Всего:</b> ${total_all_users:.6f} | 👥 {len(users)} юзеров"
-            )
-            
-            message = "".join(message_parts)
-            
-            # Telegram имеет ограничение на длину сообщения (4096 символов)
-            if len(message) > 4000:
-                # Разбиваем на несколько сообщений
-                await update.message.reply_text(
-                    "📊 <b>Статистика расходов пользователей</b>\n\n"
-                    "Слишком много данных, отправляю топ-20...",
-                    parse_mode='HTML'
-                )
-                
-                message_parts = ["📊 <b>Топ-20 пользователей</b>\n"]
-                for idx, (user_id, username, first_name, last_name, total_spent, total_requests) in enumerate(users[:20], 1):
-                    # Формируем имя пользователя (приоритет username)
-                    display_name = ""
-                    if username:
-                        display_name = f"@{username}"
-                    elif first_name:
-                        display_name = first_name
-                        if last_name:
-                            display_name += f" {last_name}"
-                    else:
-                        display_name = f"User {user_id}"
-                    
-                    medal = ""
-                    if idx == 1:
-                        medal = "🥇 "
-                    elif idx == 2:
-                        medal = "🥈 "
-                    elif idx == 3:
-                        medal = "🥉 "
-                    
-                    # Всё в одну строку
-                    message_parts.append(
-                        f"\n{medal}<b>{idx}.</b> {display_name} • ${total_spent:.4f} • {total_requests} запросов"
-                    )
-                
-                message_parts.append(f"\n\n💵 <b>Всего:</b> ${total_all_users:.6f} | 👥 {len(users)} юзеров")
-                message = "".join(message_parts)
-            
-            await update.message.reply_text(message, parse_mode='HTML')
-            logger.info("Статистика расходов пользователей успешно отправлена")
-            
-        except Exception as e:
-            logger.error(f"Ошибка при получении статистики: {e}")
-            await update.message.reply_text(
-                f"❌ Произошла ошибка при получении статистики: {str(e)}"
-            )
     
     async def reload_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /reload - перезагружает конфигурацию бота"""
@@ -2262,7 +1858,7 @@ class TelegramWhisperBot:
             "questions": validated,
         }
 
-    async def _quiz_send_openrouter_request(self, prompt: str, api_config: dict) -> Optional[tuple]:
+    async def _quiz_send_openrouter_request(self, prompt: str, api_config: dict) -> Optional[str]:
         """Отдельный вызов OpenRouter с response_format=json_object для гарантированного JSON."""
         try:
             headers = {
@@ -2290,8 +1886,7 @@ class TelegramWhisperBot:
             except (KeyError, IndexError) as e:
                 logger.error(f"Quiz: неожиданная структура ответа OpenRouter: {e}")
                 return None
-            generation_id = self.get_generation_id_from_response(result)
-            return (text, generation_id)
+            return text
         except Exception as e:
             logger.error(f"Quiz: ошибка при отправке запроса в OpenRouter: {e}", exc_info=True)
             return None
@@ -2300,7 +1895,6 @@ class TelegramWhisperBot:
         """Генерирует викторину на тему через OpenRouter (gemini-3.1-pro-preview).
 
         Делает одну повторную попытку при невалидном JSON. Возвращает dict {topic, questions:[...]} или None.
-        Стоимость генерации трекаем через track_generation_cost.
         """
         api_config = self.get_api_config("quiz_api")
 
@@ -2340,19 +1934,7 @@ class TelegramWhisperBot:
             if not result:
                 logger.warning(f"Quiz: попытка {attempt} — пустой ответ от модели")
                 continue
-            text, generation_id = result
-            if generation_id and user is not None:
-                try:
-                    await self.track_generation_cost(
-                        generation_id,
-                        user.id,
-                        user.username or "",
-                        user.first_name or "",
-                        user.last_name or "",
-                        "quiz",
-                    )
-                except Exception as e:
-                    logger.warning(f"Quiz: не удалось затрекать стоимость: {e}")
+            text = result
             cleaned = self._quiz_strip_json_markdown(text)
             try:
                 parsed = json.loads(cleaned)
@@ -2999,8 +2581,8 @@ class TelegramWhisperBot:
         model: str,
         system_text: str | None = None,
         temperature: float | None = None,
-    ) -> Optional[tuple]:
-        """Vision-запрос к OpenRouter. Возвращает (text, generation_id) или None."""
+    ) -> Optional[str]:
+        """Vision-запрос к OpenRouter. Возвращает text или None."""
         try:
             mime_type = self._mcg_image_mime_type(image_data)
             image_base64 = base64.b64encode(image_data).decode('utf-8')
@@ -3034,25 +2616,11 @@ class TelegramWhisperBot:
             result = response.json()
             logger.info(f"Ответ OpenRouter (mcg): {self._format_api_result_for_log(result)}")
             text = result['choices'][0]['message']['content']
-            generation_id = self.get_generation_id_from_response(result)
-            return (text, generation_id)
+            return text
         except Exception as e:
             logger.error(f"MCG: ошибка vision-запроса: {e}", exc_info=True)
             return None
 
-    async def _mcg_track_cost(self, generation_id: Optional[str], user, command: str = "mcg"):
-        if generation_id and user is not None:
-            try:
-                await self.track_generation_cost(
-                    generation_id,
-                    user.id,
-                    user.username or "",
-                    user.first_name or "",
-                    user.last_name or "",
-                    command,
-                )
-            except Exception as e:
-                logger.warning(f"MCG: не удалось затрекать стоимость: {e}")
 
     async def _mcg_crop_image(self, image_data: bytes, api_config: dict, user) -> Optional[bytes]:
         from mtg.crop import (
@@ -3078,8 +2646,7 @@ class TelegramWhisperBot:
             if not result:
                 logger.warning(f"MCG: crop attempt {attempt} — пустой ответ от API")
                 continue
-            text, generation_id = result
-            await self._mcg_track_cost(generation_id, user)
+            text = result
             coords = parse_crop_json(text)
             if not coords:
                 logger.warning(
@@ -3113,9 +2680,7 @@ class TelegramWhisperBot:
         )
         if not result:
             return None
-        text, generation_id = result
-        await self._mcg_track_cost(generation_id, user)
-        return text
+        return result
 
     async def mcg_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик /mcg — генерация MTG-карты из последнего изображения в чате."""
@@ -4070,8 +3635,7 @@ class TelegramWhisperBot:
         """Отправляет изображение в AI API для описания (Grok или OpenRouter)
         
         Returns:
-            tuple: (description, generation_id) для OpenRouter
-            str: description для Grok (без generation_id)
+            str: description
             None: в случае ошибки
         """
         try:
@@ -4095,10 +3659,8 @@ class TelegramWhisperBot:
             logger.info(f"API конфигурация: {api_config}")
             
             if provider == "grok":
-                # Grok не возвращает generation_id
                 return await self._describe_with_grok(image_data, image_base64, mime_type, api_config)
             else:
-                # Все остальные провайдеры (openrouter, openrouter_nvidia, etc.) возвращают (description, generation_id)
                 return await self._describe_with_openrouter(image_data, image_base64, mime_type, api_config)
                 
         except Exception as e:
@@ -4238,9 +3800,8 @@ class TelegramWhisperBot:
                     result = response.json()
                     logger.info(f"Ответ OpenRouter API (describe): {self._format_api_result_for_log(result)}")
                     description = result['choices'][0]['message']['content']
-                    generation_id = self.get_generation_id_from_response(result)
                     logger.info("Описание изображения успешно получено через OpenRouter")
-                    return (description, generation_id)
+                    return description
                 except json.JSONDecodeError as e:
                     logger.error(f"Ошибка парсинга JSON от OpenRouter API (describe): {e}")
                     logger.error(f"Полный сырой ответ: {self._single_line_log_preview(raw_response, 2000)}")
@@ -4257,7 +3818,7 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при описании изображения через OpenRouter: {e}")
             return None
     
-    async def ask_with_openrouter(self, prompt: str, api_config: dict) -> Optional[tuple]:
+    async def ask_with_openrouter(self, prompt: str, api_config: dict) -> Optional[str]:
         """Отправляет текстовый запрос в OpenRouter API
         
         Args:
@@ -4265,7 +3826,7 @@ class TelegramWhisperBot:
             api_config: Конфигурация API
             
         Returns:
-            tuple: (response_text, generation_id) или None в случае ошибки
+            str: response_text или None в случае ошибки
         """
         try:
             headers = {
@@ -4315,9 +3876,8 @@ class TelegramWhisperBot:
                     result = response.json()
                     logger.info(f"Ответ OpenRouter API (ask): {self._format_api_result_for_log(result)}")
                     response_text = result['choices'][0]['message']['content']
-                    generation_id = self.get_generation_id_from_response(result)
                     logger.info("Текстовый ответ успешно получен через OpenRouter")
-                    return (response_text, generation_id)
+                    return response_text
                 except json.JSONDecodeError as e:
                     logger.error(f"Ошибка парсинга JSON от OpenRouter API (ask): {e}")
                     logger.error(f"Полный сырой ответ: {self._single_line_log_preview(raw_response, 2000)}")
@@ -4424,9 +3984,6 @@ class TelegramWhisperBot:
                 logger.info(f"Получен ответ от API, обрабатываю...")
                 logger.info(f"Ответ API: {self._format_api_result_for_log(result)}")
                 
-                # Извлекаем generation_id для отслеживания стоимости
-                generation_id = self.get_generation_id_from_response(result)
-                
                 # Проверяем наличие ошибок в ответе
                 has_error, error_type, should_retry = self._check_api_response_error(result)
                 
@@ -4442,8 +3999,7 @@ class TelegramWhisperBot:
                         else:
                             error_msg = f"Ошибка генерации изображения (native_finish_reason: {error_type})"
                         logger.error(error_msg)
-                        # Возвращаем ошибку с generation_id для отслеживания стоимости
-                        return {'error': error_msg, 'generation_id': generation_id}
+                        return {'error': error_msg}
                 
                 # Проверяем различные форматы ответа
                 if 'choices' in result and len(result['choices']) > 0:
@@ -4471,13 +4027,12 @@ class TelegramWhisperBot:
                                         logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                         return {
                                             'data': image_bytes,
-                                            'format': image_format,
-                                            'generation_id': generation_id
+                                            'format': image_format
                                         }
                                 else:
                                     # Обычный HTTP URL
                                     logger.info("Изображение успешно сгенерировано через OpenRouter (URL)")
-                                    return {'url': image_url, 'generation_id': generation_id}
+                                    return {'url': image_url}
                         
                         # Проверяем message.content
                         if 'content' in message:
@@ -4494,21 +4049,20 @@ class TelegramWhisperBot:
                                     logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                     return {
                                         'data': image_bytes,
-                                        'format': image_format,
-                                        'generation_id': generation_id
+                                        'format': image_format
                                     }
                             
                             # Если content - это обычный HTTP URL
                             if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
                                 logger.info("Изображение успешно сгенерировано через OpenRouter (URL в content)")
-                                return {'url': content, 'generation_id': generation_id}
+                                return {'url': content}
                             
                             # Если content - это текст с встроенным URL
                             url_match = re.search(r'(https?://[^\s]+)', content)
                             if url_match:
                                 image_url = url_match.group(1)
                                 logger.info("Изображение успешно сгенерировано через OpenRouter (URL извлечен из текста)")
-                                return {'url': image_url, 'generation_id': generation_id}
+                                return {'url': image_url}
                     
                     # Проверяем data URL для base64
                     if 'data' in result:
@@ -4526,12 +4080,11 @@ class TelegramWhisperBot:
                                         logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                         return {
                                             'data': image_bytes,
-                                            'format': image_format,
-                                            'generation_id': generation_id
+                                            'format': image_format
                                         }
                                 else:
                                     logger.info("Изображение успешно сгенерировано через OpenRouter (URL в data)")
-                                    return {'url': url, 'generation_id': generation_id}
+                                    return {'url': url}
                 
                 logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
@@ -4618,9 +4171,6 @@ class TelegramWhisperBot:
                 logger.info(f"Получен ответ от API, обрабатываю...")
                 logger.info(f"Ответ API: {self._format_api_result_for_log(result)}")
                 
-                # Извлекаем generation_id для отслеживания стоимости
-                generation_id = self.get_generation_id_from_response(result)
-                
                 # Проверяем наличие ошибок в ответе
                 has_error, error_type, should_retry = self._check_api_response_error(result)
                 
@@ -4636,8 +4186,7 @@ class TelegramWhisperBot:
                         else:
                             error_msg = f"Ошибка изменения изображения (native_finish_reason: {error_type})"
                         logger.error(error_msg)
-                        # Возвращаем ошибку с generation_id для отслеживания стоимости
-                        return {'error': error_msg, 'generation_id': generation_id}
+                        return {'error': error_msg}
                 
                 # Проверяем различные форматы ответа
                 if 'choices' in result and len(result['choices']) > 0:
@@ -4665,13 +4214,12 @@ class TelegramWhisperBot:
                                         logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                         return {
                                             'data': image_bytes,
-                                            'format': image_format,
-                                            'generation_id': generation_id
+                                            'format': image_format
                                         }
                                 else:
                                     # Обычный HTTP URL
                                     logger.info("Изображение успешно изменено через OpenRouter (URL)")
-                                    return {'url': image_url, 'generation_id': generation_id}
+                                    return {'url': image_url}
                         
                         # Проверяем message.content
                         if 'content' in message:
@@ -4688,21 +4236,20 @@ class TelegramWhisperBot:
                                     logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                     return {
                                         'data': image_bytes,
-                                        'format': image_format,
-                                        'generation_id': generation_id
+                                        'format': image_format
                                     }
                             
                             # Если content - это обычный HTTP URL
                             if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
                                 logger.info("Изображение успешно изменено через OpenRouter (URL в content)")
-                                return {'url': content, 'generation_id': generation_id}
+                                return {'url': content}
                             
                             # Если content - это текст с встроенным URL
                             url_match = re.search(r'(https?://[^\s]+)', content)
                             if url_match:
                                 image_url = url_match.group(1)
                                 logger.info("Изображение успешно изменено через OpenRouter (URL извлечен из текста)")
-                                return {'url': image_url, 'generation_id': generation_id}
+                                return {'url': image_url}
                     
                     # Проверяем data URL для base64
                     if 'data' in result:
@@ -4720,12 +4267,11 @@ class TelegramWhisperBot:
                                         logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                         return {
                                             'data': image_bytes,
-                                            'format': image_format,
-                                            'generation_id': generation_id
+                                            'format': image_format
                                         }
                                 else:
                                     logger.info("Изображение успешно изменено через OpenRouter (URL в data)")
-                                    return {'url': url, 'generation_id': generation_id}
+                                    return {'url': url}
                 
                 logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
@@ -4816,17 +4362,13 @@ class TelegramWhisperBot:
                 logger.info(f"Получен ответ от API, обрабатываю...")
                 logger.info(f"Ответ API (mergeimage): {self._format_api_result_for_log(result)}")
                 
-                # Извлекаем generation_id для отслеживания стоимости
-                generation_id = self.get_generation_id_from_response(result)
-                
                 # Проверяем наличие ошибок в ответе
                 has_error, error_type, should_retry = self._check_api_response_error(result)
                 
                 if has_error:
                     error_msg = f"Ошибка обработки изображений (native_finish_reason: {error_type})"
                     logger.error(error_msg)
-                    # Возвращаем ошибку с generation_id для отслеживания стоимости
-                    return {'error': error_msg, 'generation_id': generation_id}
+                    return {'error': error_msg}
                 
                 # Проверяем различные форматы ответа
                 if 'choices' in result and len(result['choices']) > 0:
@@ -4853,13 +4395,12 @@ class TelegramWhisperBot:
                                         logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                         return {
                                             'data': image_bytes,
-                                            'format': image_format,
-                                            'generation_id': generation_id
+                                            'format': image_format
                                         }
                                 else:
                                     # Обычный HTTP URL
                                     logger.info("Изображение успешно обработано через OpenRouter (URL)")
-                                    return {'url': image_url, 'generation_id': generation_id}
+                                    return {'url': image_url}
                         
                         # Проверяем message.content (текстовый ответ или base64)
                         if 'content' in message:
@@ -4876,26 +4417,25 @@ class TelegramWhisperBot:
                                     logger.info(f"Изображение успешно декодировано, формат: {image_format}, размер: {len(image_bytes)} байт")
                                     return {
                                         'data': image_bytes,
-                                        'format': image_format,
-                                        'generation_id': generation_id
+                                        'format': image_format
                                     }
                             
                             # Если content - это обычный HTTP URL
                             if isinstance(content, str) and (content.startswith('http://') or content.startswith('https://')):
                                 logger.info("Изображение успешно обработано через OpenRouter (URL в content)")
-                                return {'url': content, 'generation_id': generation_id}
+                                return {'url': content}
                             
                             # Если content - это текст с встроенным URL
                             url_match = re.search(r'(https?://[^\s]+)', content)
                             if url_match:
                                 image_url = url_match.group(1)
                                 logger.info("Изображение успешно обработано через OpenRouter (URL извлечен из текста)")
-                                return {'url': image_url, 'generation_id': generation_id}
+                                return {'url': image_url}
                             
                             # Если это просто текстовое описание/ответ
                             if isinstance(content, str) and len(content) > 0:
                                 logger.info("Получен текстовый ответ от API")
-                                return {'description': content, 'generation_id': generation_id}
+                                return {'description': content}
                 
                 logger.error(
                     f"Неожиданный формат ответа от OpenRouter API (mergeimage): {self._format_api_result_for_log(result)}"
@@ -6910,7 +6450,6 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("changelast", self.changelast_command))
         self.application.add_handler(CommandHandler("mergeimage", self.mergeimage_command))
         self.application.add_handler(CommandHandler("balance", self.balance_command))
-        self.application.add_handler(CommandHandler("statistics", self.statistics_command))
         self.application.add_handler(CommandHandler("reload", self.reload_command))
         self.application.add_handler(CommandHandler("randomsteamgame", self.randomsteamgame_command))
         self.application.add_handler(CommandHandler("quiz", self.quiz_command))
