@@ -5194,7 +5194,7 @@ class TelegramWhisperBot:
                 logger.warning("ИИ не ответил на запрос валидации — пропускаем проверку")
                 return []
 
-            response_text, _ = result
+            response_text = result
             logger.info(f"Ответ ИИ на валидацию: {response_text}")
 
             match = re.search(r'##DQ:\[([^\]]*)\]##|##DQ:([^#]*)##', response_text)
@@ -6009,7 +6009,7 @@ class TelegramWhisperBot:
         story = None
 
         if result:
-            response_text, _ = result
+            response_text = result
             winner_re = re.search(r'##WINNER:(.+?)##', response_text)
             story = re.sub(r'##WINNER:.+?##', '', response_text).strip()
 
