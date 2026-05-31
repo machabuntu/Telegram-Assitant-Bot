@@ -87,39 +87,6 @@ GS_PT_FONT = _gs_pt.get("font", "belerenbsc")
 GS_PT_FONT_SIZE: int = _gs_pt.get("font_size", 60)
 GS_PT_CLEARANCE_Y: int = _gs_pt.get("clearance_y", 1858)
 
-_pw = _L.get("planeswalker", {})
-PW_ART = (0, 0, CANVAS_W, CANVAS_H)
-PW_TITLE = tuple(_pw.get("title", {}).get("box", [128, 90, 1100, 100]))
-PW_TITLE_FONT = _pw.get("title", {}).get("font", "belerenb")
-PW_TITLE_FONT_SIZE: int = _pw.get("title", {}).get("font_size", 56)
-PW_MANA_Y: int = _pw.get("mana", {}).get("y", 90)
-PW_MANA_RIGHT: int = _pw.get("mana", {}).get("right", 1394)
-PW_TYPE = tuple(_pw.get("type", {}).get("box", [128, 1189, 1243, 114]))
-PW_TYPE_FONT = _pw.get("type", {}).get("font", "belerenb")
-PW_TYPE_FONT_SIZE: int = _pw.get("type", {}).get("font_size", 42)
-_pw_ab = _pw.get("ability", {})
-PW_ABILITY_START_Y: int = _pw_ab.get("start_y", 900)
-PW_ABILITY_X: int = _pw_ab.get("x", 180)
-PW_ABILITY_W: int = _pw_ab.get("width", 1150)
-PW_ABILITY_H: int = _pw_ab.get("height", 200)
-PW_ABILITY_GAP: int = _pw_ab.get("gap", 20)
-PW_ABILITY_FONT = _pw_ab.get("font", "mplantin")
-PW_ABILITY_MAX: int = _pw_ab.get("max_size", 44)
-PW_ABILITY_MIN: int = _pw_ab.get("min_size", 20)
-PW_ABILITY_ICON_SIZE = tuple(_pw_ab.get("icon_size", [90, 65]))
-PW_ABILITY_OVERLAY_COLOR = tuple(_pw_ab.get("overlay_color", [20, 20, 20, 160]))
-PW_ABILITY_COST_FONT = _pw_ab.get("cost_font", "belerenb")
-PW_ABILITY_COST_FONT_SIZE: int = _pw_ab.get("cost_font_size", 38)
-PW_ABILITY_COST_OFFSET_X: int = _pw_ab.get("cost_text_offset_x", 70)
-PW_ABILITY_COST_OFFSET_Y_PLUS: int = _pw_ab.get("cost_text_offset_y_plus", 25)
-PW_ABILITY_COST_OFFSET_Y_MINUS: int = _pw_ab.get("cost_text_offset_y_minus", 85)
-PW_ABILITY_COST_OFFSET_Y_NEUTRAL: int = _pw_ab.get("cost_text_offset_y_neutral", 55)
-_pw_lo = _pw.get("loyalty", {})
-PW_LOYALTY_X: int = _pw_lo.get("x", 1310)
-PW_LOYALTY_Y: int = _pw_lo.get("y", 1950)
-PW_LOYALTY_FONT = _pw_lo.get("font", "belerenb")
-PW_LOYALTY_FONT_SIZE: int = _pw_lo.get("font_size", 56)
-
 _SET_INFO = SimpleNamespace(
     year=2026,
     version="MCG",
@@ -462,108 +429,7 @@ def render_standard_card(details: CardDetails, art_path: Path) -> Image.Image:
     return canvas
 
 
-def render_planeswalker(details: CardDetails, art_path: Path) -> Image.Image:
-    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
-    cc = _frame_color_code(details.colors)
-
-    if art_path.exists() and art_path.stat().st_size > 0:
-        art = Image.open(art_path).convert("RGBA")
-        art = art.resize((PW_ART[2], PW_ART[3]), Image.LANCZOS)
-        canvas.paste(art, (PW_ART[0], PW_ART[1]))
-
-    frame = _load_frame(Assets.pw_frame(cc))
-    if frame:
-        canvas = Image.alpha_composite(canvas, frame)
-
-    draw = ImageDraw.Draw(canvas)
-
-    if details.mana_cost:
-        _render_mana_cost(canvas, details.mana_cost, PW_MANA_RIGHT, PW_MANA_Y)
-        draw = ImageDraw.Draw(canvas)
-
-    tc = _text_color(cc)
-    title_font = _load_font(PW_TITLE_FONT, PW_TITLE_FONT_SIZE)
-    _draw_centered_text(draw, details.name, PW_TITLE[0], PW_TITLE[1], PW_TITLE[2], PW_TITLE[3], title_font, fill=tc)
-
-    type_font = _load_font(PW_TYPE_FONT, PW_TYPE_FONT_SIZE)
-    _draw_centered_text(draw, details.type_line, PW_TYPE[0], PW_TYPE[1], PW_TYPE[2], PW_TYPE[3], type_font, fill=tc)
-    canvas = _render_rarity_symbol(canvas, details.rarity, PW_TYPE)
-    draw = ImageDraw.Draw(canvas)
-
-    _COST_RE = re.compile(r'^([+\-\u2212]?\d+|0)\s*:\s*')
-
-    if details.abilities:
-        ability_icons = {
-            "+": Assets.PW_IMAGES / "planeswalkerPlus.png",
-            "\u2212": Assets.PW_IMAGES / "planeswalkerMinus.png",
-            "-": Assets.PW_IMAGES / "planeswalkerMinus.png",
-            "0": Assets.PW_IMAGES / "planeswalkerNeutral.png",
-        }
-        icon_x = PW_ABILITY_X - PW_ABILITY_ICON_SIZE[0] - 10
-
-        mask_img = Image.open(Assets.PW_IMAGES / "planeswalkerMaskText.png").convert("RGBA")
-        solid = Image.new("RGBA", (CANVAS_W, CANVAS_H), tuple(PW_ABILITY_OVERLAY_COLOR))
-        shaped = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-        shaped.paste(solid, mask=mask_img.split()[3])
-        canvas = Image.alpha_composite(canvas, shaped)
-        draw = ImageDraw.Draw(canvas)
-
-        cost_font = _load_font(PW_ABILITY_COST_FONT, PW_ABILITY_COST_FONT_SIZE)
-        cur_y = PW_ABILITY_START_Y
-
-        for ab_text in details.abilities:
-            icon_key = "0"
-            if ab_text.startswith("+"):
-                icon_key = "+"
-            elif ab_text.startswith("-") or ab_text.startswith("\u2212"):
-                icon_key = "-"
-
-            m = _COST_RE.match(ab_text)
-            if m:
-                cost_label = m.group(1)
-                ability_body = ab_text[m.end():]
-            else:
-                cost_label = ""
-                ability_body = ab_text
-
-            icon_path = ability_icons.get(icon_key)
-            if icon_path and icon_path.exists():
-                icon = Image.open(icon_path).convert("RGBA")
-                icon = icon.resize(PW_ABILITY_ICON_SIZE, Image.LANCZOS)
-                canvas.paste(icon, (icon_x, cur_y), icon)
-                draw = ImageDraw.Draw(canvas)
-
-                if cost_label:
-                    cost_label_draw = cost_label.replace("\u2212", "-")
-                    cb = draw.textbbox((0, 0), cost_label_draw, font=cost_font)
-                    cw, ch = cb[2] - cb[0], cb[3] - cb[1]
-                    _offset_y_map = {
-                        "+": PW_ABILITY_COST_OFFSET_Y_PLUS,
-                        "-": PW_ABILITY_COST_OFFSET_Y_MINUS,
-                        "0": PW_ABILITY_COST_OFFSET_Y_NEUTRAL,
-                    }
-                    cost_offset_y = _offset_y_map.get(icon_key, PW_ABILITY_COST_OFFSET_Y_NEUTRAL)
-                    cx = icon_x + PW_ABILITY_COST_OFFSET_X - cw // 2
-                    cy = cur_y + cost_offset_y - ch // 2
-                    draw.text((cx, cy), cost_label_draw, fill="white", font=cost_font)
-
-            _render_text_block(draw, canvas, ability_body, PW_ABILITY_X, cur_y, PW_ABILITY_W, PW_ABILITY_H, font_name=PW_ABILITY_FONT, color=tc, max_size=PW_ABILITY_MAX, min_size=PW_ABILITY_MIN)
-            cur_y += PW_ABILITY_H + PW_ABILITY_GAP
-
-    if details.starting_loyalty is not None:
-        loyalty_font = _load_font(PW_LOYALTY_FONT, PW_LOYALTY_FONT_SIZE)
-        lt = str(details.starting_loyalty)
-        bbox = draw.textbbox((0, 0), lt, font=loyalty_font)
-        tw = bbox[2] - bbox[0]
-        draw.text((PW_LOYALTY_X - tw // 2, PW_LOYALTY_Y), lt, fill="white", font=loyalty_font)
-
-    _render_footer(draw, cc)
-    return canvas
-
-
 def render_card(details: CardDetails, art_path: Path) -> Image.Image:
-    if details.card_type == "planeswalker" or "planeswalker" in details.type_line.lower():
-        return render_planeswalker(details, art_path)
     return render_standard_card(details, art_path)
 
 

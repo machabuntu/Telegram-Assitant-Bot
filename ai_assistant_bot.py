@@ -2731,7 +2731,7 @@ class TelegramWhisperBot:
             from mtg.renderer import render_card_to_bytes
 
             details = parse_card_response(card_text)
-            logger.info(f"MCG: карта «{details.name}», тип={details.card_type}, colors={details.colors}")
+            logger.info(f"MCG: карта «{details.name}», colors={details.colors}")
 
             await self.update_status(processing_msg, "🎨 Собираю карту…")
 

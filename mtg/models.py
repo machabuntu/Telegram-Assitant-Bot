@@ -9,7 +9,6 @@ from pydantic import BaseModel
 
 class CardDetails(BaseModel):
     name: str
-    card_type: str = "standard"
     mana_cost: str = ""
     type_line: str = ""
     colors: str = ""
@@ -18,9 +17,6 @@ class CardDetails(BaseModel):
 
     power: Optional[str] = None
     toughness: Optional[str] = None
-
-    starting_loyalty: Optional[int] = None
-    abilities: Optional[list[str]] = None
 
     rules_text: str = ""
     flavor_text: str = ""

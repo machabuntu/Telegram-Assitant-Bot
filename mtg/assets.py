@@ -22,13 +22,11 @@ _DEFAULT_FONT_FILES = {
 
 class Assets:
     FRAMES_SHOWCASE = ASSETS_ROOT / "img" / "frames" / "m15" / "genericShowcase"
-    FRAMES_PW_BORDERLESS = ASSETS_ROOT / "img" / "frames" / "planeswalker" / "borderless"
     PT_BOXES = ASSETS_ROOT / "img" / "frames" / "m15" / "nickname"
     MANA_SYMBOLS = ASSETS_ROOT / "img" / "manaSymbols"
     MANA_SYMBOLS_PNG = ASSETS_ROOT / "img" / "manaSymbols_png"
     FONTS = ASSETS_ROOT / "data" / "fonts"
     FONTS_ALT = ASSETS_ROOT / "fonts"
-    PW_IMAGES = ASSETS_ROOT / "data" / "images" / "cardImages" / "planeswalker"
     SET_SYMBOLS = ASSETS_ROOT / "img" / "setSymbols" / "official"
     SET_SYMBOLS_PNG = ASSETS_ROOT / "img" / "setSymbols_png" / "official"
 
@@ -37,10 +35,6 @@ class Assets:
     COLOR_MAP = {
         "W": "W", "U": "U", "B": "B", "R": "R", "G": "G",
         "M": "M", "A": "A", "L": "L", "C": "A",
-    }
-    COLOR_MAP_LOWER = {
-        "W": "w", "U": "u", "B": "b", "R": "r", "G": "g",
-        "M": "m", "A": "a", "L": "l", "C": "a",
     }
 
     @classmethod
@@ -54,11 +48,6 @@ class Assets:
     def showcase_frame(cls, color_code: str) -> Path:
         c = cls.COLOR_MAP.get(color_code, "M")
         return cls.FRAMES_SHOWCASE / f"m15GenericShowcaseFrame{c}.png"
-
-    @classmethod
-    def pw_frame(cls, color_code: str) -> Path:
-        c = cls.COLOR_MAP_LOWER.get(color_code, "m")
-        return cls.FRAMES_PW_BORDERLESS / f"{c}.png"
 
     @classmethod
     def pt_box(cls, color_code: str) -> Path:

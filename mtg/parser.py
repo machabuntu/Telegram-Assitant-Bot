@@ -7,9 +7,8 @@ import re
 from mtg.models import CardDetails
 
 _KNOWN_FIELDS = frozenset({
-    "CARD_TYPE", "NAME", "COLORS", "RARITY", "MANA_COST", "TYPE_LINE",
+    "NAME", "COLORS", "RARITY", "MANA_COST", "TYPE_LINE",
     "POWER", "TOUGHNESS", "RULES_TEXT", "FLAVOR_TEXT",
-    "STARTING_LOYALTY", "ABILITY_1", "ABILITY_2", "ABILITY_3", "ABILITY_4",
 })
 
 _FIELD_LINE_RE = re.compile(
@@ -120,14 +119,7 @@ def _normalise_mana_cost(raw: str) -> str:
     return "".join(parts)
 
 
-def _parse_card_type(text: str) -> str:
-    raw = _parse_field(text, "CARD_TYPE").lower().strip()
-    if "planeswalker" in raw or raw == "pw":
-        return "planeswalker"
-    return "standard"
-
-
-def _parse_response_standard(text: str) -> CardDetails:
+def _parse_response(text: str) -> CardDetails:
     name = _parse_field(text, "NAME") or "Безымянная карта"
     mana_cost = _normalise_mana_cost(_parse_field(text, "MANA_COST"))
     type_line = _parse_field(text, "TYPE_LINE")
@@ -140,7 +132,6 @@ def _parse_response_standard(text: str) -> CardDetails:
 
     return CardDetails(
         name=name,
-        card_type="standard",
         mana_cost=mana_cost,
         type_line=type_line or "Карта",
         colors=colors,
@@ -152,37 +143,6 @@ def _parse_response_standard(text: str) -> CardDetails:
     )
 
 
-def _parse_response_planeswalker(text: str) -> CardDetails:
-    name = _parse_field(text, "NAME") or "Безымянный planeswalker"
-    mana_cost = _normalise_mana_cost(_parse_field(text, "MANA_COST"))
-    type_line = _parse_field(text, "TYPE_LINE")
-    colors = _parse_field(text, "COLORS").upper().replace(" ", "")
-    rarity = _parse_field(text, "RARITY").lower() or "rare"
-    loyalty_str = _parse_field(text, "STARTING_LOYALTY")
-
-    abilities: list[str] = []
-    for key in ("ABILITY_1", "ABILITY_2", "ABILITY_3", "ABILITY_4"):
-        val = _parse_field(text, key)
-        if val:
-            abilities.append(_normalise_mana_braces(val))
-
-    try:
-        loyalty = int(loyalty_str)
-    except (ValueError, TypeError):
-        loyalty = 3
-
-    return CardDetails(
-        name=name,
-        card_type="planeswalker",
-        mana_cost=mana_cost,
-        type_line=type_line or "Planeswalker",
-        colors=colors,
-        rarity=rarity,
-        starting_loyalty=loyalty,
-        abilities=abilities,
-    )
-
-
 def _normalize_yo_to_e(text: str) -> str:
     """Replace yo (Ё/ё) with ye (Е/е) in generated card text."""
     return text.translate(str.maketrans("ёЁ", "еЕ"))
@@ -191,7 +151,4 @@ def _normalize_yo_to_e(text: str) -> str:
 def parse_card_response(text: str) -> CardDetails:
     """Parse AI response text into CardDetails."""
     text = _normalize_yo_to_e(text)
-    card_type = _parse_card_type(text)
-    if card_type == "planeswalker":
-        return _parse_response_planeswalker(text)
-    return _parse_response_standard(text)
+    return _parse_response(text)
