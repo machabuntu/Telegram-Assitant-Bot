@@ -6191,8 +6191,9 @@ class TelegramWhisperBot:
                     "INSERT INTO tournament_scores (user_id, username, total_points, first_places, second_places, semifinal_places) "
                     "VALUES (?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(user_id) DO UPDATE SET "
-                    "username=excluded.username, total_points=total_points+excluded.total_points, "
-                    f"{field}={field}+1",
+                    "username=excluded.username, "
+                    "total_points=tournament_scores.total_points+excluded.total_points, "
+                    f"{field}=tournament_scores.{field}+1",
                     (user_id, username, points,
                      1 if field == "first_places" else 0,
                      1 if field == "second_places" else 0,
