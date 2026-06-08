@@ -2581,6 +2581,7 @@ class TelegramWhisperBot:
         model: str,
         system_text: str | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Optional[str]:
         """Vision-запрос к OpenRouter. Возвращает text или None."""
         try:
@@ -2603,7 +2604,9 @@ class TelegramWhisperBot:
                     },
                 ],
             })
-            data = {"model": model, "messages": messages, "max_tokens": 4000}
+            data: dict = {"model": model, "messages": messages}
+            if max_tokens is not None:
+                data["max_tokens"] = max_tokens
             if temperature is not None:
                 data["temperature"] = temperature
             logger.info(f"MCG: vision-запрос OpenRouter (модель: {model})")
@@ -2615,8 +2618,15 @@ class TelegramWhisperBot:
                 return None
             result = response.json()
             logger.info(f"Ответ OpenRouter (mcg): {self._format_api_result_for_log(result)}")
-            text = result['choices'][0]['message']['content']
-            return text
+            choice = result["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "length":
+                logger.warning(
+                    "MCG: ответ обрезан по лимиту токенов (finish_reason=length, "
+                    f"native={choice.get('native_finish_reason')})"
+                )
+            text = choice["message"].get("content") or ""
+            return text or None
         except Exception as e:
             logger.error(f"MCG: ошибка vision-запроса: {e}", exc_info=True)
             return None
@@ -2641,7 +2651,8 @@ class TelegramWhisperBot:
         for attempt in (1, 2):
             logger.info(f"MCG: landscape crop attempt {attempt}/2")
             result = await self._mcg_openrouter_vision(
-                image_data, CROP_USER, api_config, crop_model, system_text=CROP_SYSTEM
+                image_data, CROP_USER, api_config, crop_model,
+                system_text=CROP_SYSTEM, max_tokens=512,
             )
             if not result:
                 logger.warning(f"MCG: crop attempt {attempt} — пустой ответ от API")
@@ -5164,7 +5175,7 @@ class TelegramWhisperBot:
                 "5) Есть ли у персонажа атаки, от которых принципиально невозможно уклониться или "
                 "защититься (гарантированное попадание), и которые убивают мгновенно, игнорируя любую "
                 "броню и выносливость?\n"
-                "6) Превышает ли базовая скорость передвижения или боя персонажа скорость света, или он "
+                "6) Превышает ли скорость передвижения или боя персонажа скорость света, или он "
                 "способен находиться в нескольких местах одновременно (вездесущность)?\n"
                 "Если по чеклисту получено 2 или более «ДА» — дисквалифицируй персонажа как «слишком "
                 "сильный». В причине укажи, какие пункты совпали (например, «силовой потолок: пп. 1, 3»). "
