@@ -45,22 +45,22 @@ standard:
   art_bottom_ratio: 0.9224
   title:
     box: [128, 110, 1243, 114]
-    font: minioncyrillic
+    font: belerenb
     font_size: 62
   mana:
     y: 128
     right: 1394
   type:
     box: [128, 1189, 1243, 114]
-    font: minioncyrillic
+    font: belerenb
     font_size: 55
   rules:
     box: [129, 1323, 1242, 604]
-    font: timesnewroman
+    font: mplantin
     max_size: 45
     min_size: 20
   flavor:
-    font: timesnewromanitalic
+    font: mplantini
     max_size: 45
     min_size: 30
   pt:
