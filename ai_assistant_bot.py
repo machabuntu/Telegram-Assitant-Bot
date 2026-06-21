@@ -1287,6 +1287,16 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
                 return
             
+            # Модель вернула текст вместо изображения — отправляем текст в канал
+            if isinstance(image_result, dict) and 'description' in image_result:
+                await self.update_status(processing_msg, "ℹ️ Модель вернула текст вместо изображения.")
+                await self.send_ai_response(
+                    update.message,
+                    image_result['description'],
+                    header="🎨 <b>Модель не смогла сгенерировать изображение. Ответ модели:</b>",
+                )
+                return
+            
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображение успешно сгенерировано!")
             
@@ -1413,6 +1423,16 @@ class TelegramWhisperBot:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
                 return
             
+            # Модель вернула текст вместо изображения — отправляем текст в канал
+            if isinstance(image_result, dict) and 'description' in image_result:
+                await self.update_status(processing_msg, "ℹ️ Модель вернула текст вместо изображения.")
+                await self.send_ai_response(
+                    update.message,
+                    image_result['description'],
+                    header="✨ <b>Модель не смогла изменить изображение. Ответ модели:</b>",
+                )
+                return
+            
             # Отправляем результат
             await self.update_status(processing_msg, "✅ Изображение успешно изменено!")
             
@@ -1480,6 +1500,16 @@ class TelegramWhisperBot:
             # Проверяем на ошибку
             if isinstance(image_result, dict) and 'error' in image_result:
                 await self.update_status(processing_msg, f"❌ {image_result['error']}")
+                return
+            
+            # Модель вернула текст вместо изображения — отправляем текст в канал
+            if isinstance(image_result, dict) and 'description' in image_result:
+                await self.update_status(processing_msg, "ℹ️ Модель вернула текст вместо изображения.")
+                await self.send_ai_response(
+                    update.message,
+                    image_result['description'],
+                    header="✨ <b>Модель не смогла изменить изображение. Ответ модели:</b>",
+                )
                 return
             
             # Отправляем результат
@@ -4074,6 +4104,11 @@ class TelegramWhisperBot:
                                 image_url = url_match.group(1)
                                 logger.info("Изображение успешно сгенерировано через OpenRouter (URL извлечен из текста)")
                                 return {'url': image_url}
+                            
+                            # Если content — это просто текст (не URL), модель ответила текстом, а не изображением
+                            if isinstance(content, str) and len(content) > 0:
+                                logger.info("Получен текстовый ответ от API вместо изображения")
+                                return {'description': content}
                     
                     # Проверяем data URL для base64
                     if 'data' in result:
@@ -4096,7 +4131,7 @@ class TelegramWhisperBot:
                                 else:
                                     logger.info("Изображение успешно сгенерировано через OpenRouter (URL в data)")
                                     return {'url': url}
-                
+            
                 logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
             else:
@@ -4261,6 +4296,11 @@ class TelegramWhisperBot:
                                 image_url = url_match.group(1)
                                 logger.info("Изображение успешно изменено через OpenRouter (URL извлечен из текста)")
                                 return {'url': image_url}
+                            
+                            # Если content — это просто текст (не URL), модель ответила текстом, а не изображением
+                            if isinstance(content, str) and len(content) > 0:
+                                logger.info("Получен текстовый ответ от API вместо изображения")
+                                return {'description': content}
                     
                     # Проверяем data URL для base64
                     if 'data' in result:
@@ -4283,7 +4323,7 @@ class TelegramWhisperBot:
                                 else:
                                     logger.info("Изображение успешно изменено через OpenRouter (URL в data)")
                                     return {'url': url}
-                
+            
                 logger.error(f"Неожиданный формат ответа от OpenRouter API: {self._format_api_result_for_log(result)}")
                 return None
             else:
