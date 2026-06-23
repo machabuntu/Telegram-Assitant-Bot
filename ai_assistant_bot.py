@@ -613,7 +613,8 @@ class TelegramWhisperBot:
             "• `/quizstop` - остановить текущую викторину\n"
             "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
             "🃏 **MTG-карты:**\n"
-            "• `/mcg` - генерация MTG-карты из последнего изображения в чате\n\n"
+            "• `/mcg` - генерация MTG-карты из последнего изображения в чате\n"
+            "• `/mcgg <пожелание>` - как `/mcg`, но с пожеланием по задумке карты\n\n"
             "💰 **Баланс:**\n"
             "• `/balance` - проверка остатка средств на OpenRouter\n\n"
             "⚙️ **Управление:**\n"
@@ -2706,14 +2707,20 @@ class TelegramWhisperBot:
         logger.error("MCG: не удалось получить координаты обрезки после 2 попыток")
         return None
 
-    async def _mcg_generate_card_text(self, cropped_image: bytes, api_config: dict, user) -> Optional[str]:
-        from mtg.prompts import CARD_TEXT_SYSTEM, CARD_TEXT_USER
+    async def _mcg_generate_card_text(
+        self,
+        cropped_image: bytes,
+        api_config: dict,
+        user,
+        user_wish: str | None = None,
+    ) -> Optional[str]:
+        from mtg.prompts import CARD_TEXT_SYSTEM, build_card_text_user
 
         text_model = api_config.get("text_model", "google/gemini-3.1-pro-preview")
         text_temperature = api_config.get("text_temperature", 0.9)
         result = await self._mcg_openrouter_vision(
             cropped_image,
-            CARD_TEXT_USER,
+            build_card_text_user(user_wish),
             api_config,
             text_model,
             system_text=CARD_TEXT_SYSTEM,
@@ -2723,12 +2730,13 @@ class TelegramWhisperBot:
             return None
         return result
 
-    async def mcg_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик /mcg — генерация MTG-карты из последнего изображения в чате."""
-        if not self.is_authorized_channel(update):
-            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
-            return
-
+    async def _run_mcg_generation(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_wish: str | None = None,
+        save_tag: str = "mcg",
+    ):
         chat_id = update.effective_chat.id
         user = update.effective_user
 
@@ -2736,11 +2744,12 @@ class TelegramWhisperBot:
         try:
             image_data = await self.get_last_image_from_chat(update, context, chat_id)
             if not image_data:
+                command_hint = "/mcgg <пожелание>" if user_wish is not None else "/mcg"
                 await update.message.reply_text(
                     "❌ Не найдено изображений в чате.\n\n"
-                    "**Как использовать команду /mcg:**\n"
+                    f"**Как использовать команду {command_hint}:**\n"
                     "1. Сначала отправьте изображение в чат\n"
-                    "2. Затем используйте команду `/mcg`"
+                    f"2. Затем используйте команду `{command_hint}`"
                 )
                 return
 
@@ -2763,7 +2772,9 @@ class TelegramWhisperBot:
                 return
 
             await self.update_status(processing_msg, "🤖 Генерирую текст карты…")
-            card_text = await self._mcg_generate_card_text(cropped_image, api_config, user)
+            card_text = await self._mcg_generate_card_text(
+                cropped_image, api_config, user, user_wish=user_wish
+            )
             if not card_text:
                 await self.update_status(processing_msg, "❌ Не удалось сгенерировать текст карты.")
                 return
@@ -2772,7 +2783,8 @@ class TelegramWhisperBot:
             from mtg.renderer import render_card_to_bytes
 
             details = parse_card_response(card_text)
-            logger.info(f"MCG: карта «{details.name}», colors={details.colors}")
+            log_prefix = "MCGG" if user_wish else "MCG"
+            logger.info(f"{log_prefix}: карта «{details.name}», colors={details.colors}")
 
             await self.update_status(processing_msg, "🎨 Собираю карту…")
 
@@ -2805,12 +2817,48 @@ class TelegramWhisperBot:
                 parse_mode="Markdown",
             )
             if photo_sent:
-                await self._save_image_after_delivery(chat_id, "mcg", card_bytes, "png")
+                await self._save_image_after_delivery(chat_id, save_tag, card_bytes, "png")
 
         except Exception as e:
-            logger.error(f"MCG: ошибка: {e}", exc_info=True)
+            log_prefix = "MCGG" if user_wish else "MCG"
+            logger.error(f"{log_prefix}: ошибка: {e}", exc_info=True)
             if not photo_sent:
                 await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+
+    async def mcg_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /mcg — генерация MTG-карты из последнего изображения в чате."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        await self._run_mcg_generation(update, context)
+
+    async def mcgg_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /mcgg — как /mcg, но с пожеланием по задумке карты."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажите пожелание по задумке карты.\n\n"
+                "**Примеры:**\n"
+                "• `/mcgg карту про пиво`\n"
+                "• `/mcgg крича с дефендером`"
+            )
+            return
+
+        user_wish = ' '.join(context.args).strip()
+        if not user_wish:
+            await update.message.reply_text(
+                "❌ Укажите пожелание по задумке карты.\n\n"
+                "**Примеры:**\n"
+                "• `/mcgg карту про пиво`\n"
+                "• `/mcgg крича с дефендером`"
+            )
+            return
+
+        await self._run_mcg_generation(update, context, user_wish=user_wish, save_tag="mcgg")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик для всех сообщений"""
@@ -6512,6 +6560,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("quizstop", self.quizstop_command))
         self.application.add_handler(CommandHandler("quizleaderboards", self.quizleaderboards_command))
         self.application.add_handler(CommandHandler("mcg", self.mcg_command))
+        self.application.add_handler(CommandHandler("mcgg", self.mcgg_command))
         # Турнирные команды
         self.application.add_handler(CommandHandler("reg", self.reg_command))
         self.application.add_handler(CommandHandler("reglist", self.reglist_command))

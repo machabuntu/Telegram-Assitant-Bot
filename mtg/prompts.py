@@ -1,4 +1,4 @@
-"""AI prompt templates for /mcg."""
+"""AI prompt templates for /mcg and /mcgg."""
 
 CROP_SYSTEM = """\
 You are a computer vision assistant. Analyze images and return crop coordinates as JSON only."""
@@ -50,3 +50,14 @@ TOUGHNESS: <выносливость, если creature, иначе пусто>
 RULES_TEXT: <правила; используй \\n для переносов строк>
 FLAVOR_TEXT: <flavor-текст в кавычках или пусто>
 """
+
+CARD_TEXT_USER_WISH_SUFFIX = """\
+
+Пожелание пользователя по задумке карты: {wish}
+Обязательно учти это пожелание при генерации RULES_TEXT и остального текста карты."""
+
+
+def build_card_text_user(user_wish: str | None = None) -> str:
+    if not user_wish:
+        return CARD_TEXT_USER
+    return CARD_TEXT_USER + CARD_TEXT_USER_WISH_SUFFIX.format(wish=user_wish.strip())
