@@ -612,6 +612,8 @@ class TelegramWhisperBot:
             "• `/gigaquiz <тема>` - гигавикторина на 30 вопросов\n"
             "• `/quizstop` - остановить текущую викторину\n"
             "• `/quizleaderboards` - топ-20 игроков по очкам\n\n"
+            "🎯 **Бинго:**\n"
+            "• `/bingo <тема>` - мемное бинго 5×5 на заданную тему\n\n"
             "🃏 **MTG-карты:**\n"
             "• `/mcg` - генерация MTG-карты из последнего изображения в чате\n"
             "• `/mcgg <пожелание>` - как `/mcg`, но с пожеланием по задумке карты\n\n"
@@ -2593,7 +2595,135 @@ class TelegramWhisperBot:
             )
         await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
-    # ========================= конец блока викторины =========================
+    # ============================ Бинго (/bingo) ============================
+
+    async def _bingo_send_openrouter_request(self, prompt: str, api_config: dict) -> Optional[str]:
+        """OpenRouter-запрос с response_format=json_object для генерации бинго."""
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_config['key']}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": api_config["model"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            }
+            logger.info(f"Отправляю bingo-запрос в OpenRouter (модель: {api_config['model']})")
+            response = await asyncio.to_thread(
+                requests.post, api_config["url"], headers=headers, json=data, timeout=300
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"Bingo OpenRouter error: {response.status_code} - "
+                    f"{self._truncate_http_error_body(response.text)}"
+                )
+                return None
+            try:
+                result = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Bingo: не удалось распарсить ответ OpenRouter как JSON: {e}")
+                return None
+            logger.info(f"Ответ OpenRouter (bingo): {self._format_api_result_for_log(result)}")
+            try:
+                return result["choices"][0]["message"]["content"]
+            except (KeyError, IndexError) as e:
+                logger.error(f"Bingo: неожиданная структура ответа OpenRouter: {e}")
+                return None
+        except Exception as e:
+            logger.error(f"Bingo: ошибка при отправке запроса в OpenRouter: {e}", exc_info=True)
+            return None
+
+    async def _generate_bingo_with_llm(self, topic: str):
+        """Генерирует мемное бинго через OpenRouter. Возвращает BingoGrid или None."""
+        from bingo.parser import parse_bingo_response
+        from bingo.prompts import build_bingo_prompt
+
+        api_config = self.get_api_config("bingo_api")
+        prompt = build_bingo_prompt(topic)
+
+        for attempt in (1, 2):
+            result = await self._bingo_send_openrouter_request(prompt, api_config)
+            if not result:
+                logger.warning(f"Bingo: попытка {attempt} — пустой ответ от модели")
+                continue
+            grid = parse_bingo_response(result, topic)
+            if grid is None:
+                logger.warning(
+                    f"Bingo: попытка {attempt} — JSON не прошёл валидацию; "
+                    f"сырой текст: {self._single_line_log_preview(result, 500)}"
+                )
+                continue
+            logger.info(f"Bingo: успешно сгенерировано 25 пунктов на тему {topic!r} (попытка {attempt})")
+            return grid
+
+        return None
+
+    async def bingo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /bingo <тема> — мемное бинго 5×5."""
+        if not self.is_authorized_channel(update):
+            await update.message.reply_text("Доступ запрещен. Бот работает только в определенных каналах.")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажите тему бинго: /bingo <тема>\n"
+                "Например: /bingo пиво"
+            )
+            return
+
+        topic = " ".join(context.args).strip()
+        if not topic:
+            await update.message.reply_text(
+                "❌ Укажите тему бинго: /bingo <тема>\n"
+                "Например: /bingo пиво"
+            )
+            return
+        if len(topic) > 200:
+            await update.message.reply_text("❌ Тема слишком длинная (макс. 200 символов).")
+            return
+
+        chat_id = update.effective_chat.id
+        photo_sent = False
+        try:
+            processing_msg = await update.message.reply_text(
+                f"🎯 Генерирую мемное бинго на тему «{topic}»…"
+            )
+
+            grid = await self._generate_bingo_with_llm(topic)
+            if not grid:
+                await self.update_status(processing_msg, "❌ Не удалось сгенерировать бинго.")
+                return
+
+            await self.update_status(processing_msg, "🖼 Рисую сетку…")
+            from bingo.renderer import render_bingo_to_bytes
+
+            image_bytes = await asyncio.to_thread(render_bingo_to_bytes, grid)
+            if not image_bytes:
+                await self.update_status(processing_msg, "❌ Не удалось собрать изображение бинго.")
+                return
+
+            self.last_images[chat_id] = image_bytes
+
+            await self.update_status(processing_msg, "✅ Готово!")
+            card_file = BytesIO(image_bytes)
+            card_file.name = "bingo.png"
+            caption = f"🎯 **Бинго:** {grid.topic}"
+            photo_sent = await self._reply_photo_safe(
+                update.message,
+                card_file,
+                caption,
+                parse_mode="Markdown",
+            )
+            if photo_sent:
+                await self._save_image_after_delivery(chat_id, "bingo", image_bytes, "png")
+
+        except Exception as e:
+            logger.error(f"Bingo: ошибка: {e}", exc_info=True)
+            if not photo_sent:
+                await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+
+    # ========================= конец блока бинго =========================
 
     def _mcg_image_mime_type(self, image_data: bytes) -> str:
         if image_data.startswith(b'\x89PNG'):
@@ -6559,6 +6689,7 @@ class TelegramWhisperBot:
         self.application.add_handler(CommandHandler("gigaquiz", self.gigaquiz_command))
         self.application.add_handler(CommandHandler("quizstop", self.quizstop_command))
         self.application.add_handler(CommandHandler("quizleaderboards", self.quizleaderboards_command))
+        self.application.add_handler(CommandHandler("bingo", self.bingo_command))
         self.application.add_handler(CommandHandler("mcg", self.mcg_command))
         self.application.add_handler(CommandHandler("mcgg", self.mcgg_command))
         # Турнирные команды
