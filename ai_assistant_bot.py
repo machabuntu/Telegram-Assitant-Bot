@@ -2793,20 +2793,75 @@ class TelegramWhisperBot:
             return None
 
 
-    async def _mcg_crop_image(self, image_data: bytes, api_config: dict, user) -> Optional[bytes]:
-        from mtg.crop import (
-            crop_by_normalized_coords,
-            crop_center_5_7,
-            ensure_aspect_5_7,
-            get_image_orientation,
-            parse_crop_json,
-        )
-        from mtg.prompts import CROP_SYSTEM, CROP_USER
+    async def _mcg_outpaint_image(self, image_data: bytes, api_config: dict) -> Optional[bytes]:
+        """Outpaint landscape-изображения до 5:7 через image-модель OpenRouter."""
+        from mtg.crop import ensure_aspect_5_7
+        from mtg.prompts import OUTPAINT_USER
 
-        orientation = await asyncio.to_thread(get_image_orientation, image_data)
-        if orientation == "portrait":
-            logger.info("MCG: portrait — center crop 5:7")
-            return await asyncio.to_thread(crop_center_5_7, image_data)
+        try:
+            mime_type = self._mcg_image_mime_type(image_data)
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            outpaint_model = api_config.get("outpaint_model", "google/gemini-3.1-flash-lite-image")
+            headers = {
+                "Authorization": f"Bearer {api_config['key']}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": outpaint_model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": OUTPAINT_USER},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+                        },
+                    ],
+                }],
+                "modalities": ["image"],
+            }
+            logger.info(f"MCG: outpaint-запрос OpenRouter (модель: {outpaint_model})")
+            response = await asyncio.to_thread(
+                requests.post, api_config["url"], headers=headers, json=data, timeout=300
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    f"MCG outpaint HTTP error: {response.status_code} - "
+                    f"{self._truncate_http_error_body(response.text)}"
+                )
+                return None
+
+            result = response.json()
+            logger.info(f"Ответ OpenRouter (mcg outpaint): {self._format_api_result_for_log(result)}")
+
+            has_error, error_type, _should_retry = self._check_api_response_error(result)
+            if has_error:
+                logger.warning(f"MCG outpaint: ошибка API ({error_type}), fallback на crop")
+                return None
+
+            if self._openrouter_result_is_text_only(result):
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                logger.warning(
+                    f"MCG outpaint: модель вернула текст вместо изображения: "
+                    f"{self._single_line_log_preview(str(content), 200)}"
+                )
+                return None
+
+            image_bytes = self._extract_image_bytes_from_openrouter_result(result)
+            if not image_bytes:
+                logger.warning("MCG outpaint: не удалось извлечь изображение из ответа, fallback на crop")
+                return None
+
+            logger.info(f"MCG outpaint: успешно, размер {len(image_bytes)} байт")
+            return await asyncio.to_thread(ensure_aspect_5_7, image_bytes)
+        except Exception as e:
+            logger.warning(f"MCG outpaint: ошибка: {e}", exc_info=True)
+            return None
+
+    async def _mcg_landscape_crop(self, image_data: bytes, api_config: dict) -> Optional[bytes]:
+        """Vision-crop landscape-изображения до 5:7 (fallback после outpaint)."""
+        from mtg.crop import crop_by_normalized_coords, ensure_aspect_5_7, parse_crop_json
+        from mtg.prompts import CROP_SYSTEM, CROP_USER
 
         crop_model = api_config.get("crop_model", "google/gemini-3-flash-preview")
         for attempt in (1, 2):
@@ -2818,12 +2873,11 @@ class TelegramWhisperBot:
             if not result:
                 logger.warning(f"MCG: crop attempt {attempt} — пустой ответ от API")
                 continue
-            text = result
-            coords = parse_crop_json(text)
+            coords = parse_crop_json(result)
             if not coords:
                 logger.warning(
                     f"MCG: crop attempt {attempt} — невалидный JSON: "
-                    f"{self._single_line_log_preview(text, 300)}"
+                    f"{self._single_line_log_preview(result, 300)}"
                 )
                 continue
             logger.info(f"MCG: landscape crop coords {coords} (attempt {attempt})")
@@ -2836,6 +2890,31 @@ class TelegramWhisperBot:
 
         logger.error("MCG: не удалось получить координаты обрезки после 2 попыток")
         return None
+
+    async def _mcg_crop_image(
+        self,
+        image_data: bytes,
+        api_config: dict,
+        user,
+        status_fn=None,
+    ) -> Optional[bytes]:
+        from mtg.crop import crop_center_5_7, get_image_orientation
+
+        orientation = await asyncio.to_thread(get_image_orientation, image_data)
+        if orientation == "portrait":
+            logger.info("MCG: portrait — center crop 5:7")
+            return await asyncio.to_thread(crop_center_5_7, image_data)
+
+        if status_fn:
+            await status_fn("🖼 Дорисовываю фон…")
+        outpainted = await self._mcg_outpaint_image(image_data, api_config)
+        if outpainted:
+            return outpainted
+
+        logger.info("MCG: outpaint не удался — fallback на vision-crop")
+        if status_fn:
+            await status_fn("✂️ Обрезаю изображение…")
+        return await self._mcg_landscape_crop(image_data, api_config)
 
     async def _mcg_generate_card_text(
         self,
@@ -2888,7 +2967,13 @@ class TelegramWhisperBot:
             api_config = self.get_api_config("mcg_api")
 
             await self.update_status(processing_msg, "✂️ Обрезаю изображение…")
-            cropped_image = await self._mcg_crop_image(image_data, api_config, user)
+
+            async def update_crop_status(text: str):
+                await self.update_status(processing_msg, text)
+
+            cropped_image = await self._mcg_crop_image(
+                image_data, api_config, user, status_fn=update_crop_status
+            )
             if not cropped_image:
                 from mtg.crop import get_image_orientation
                 orientation = await asyncio.to_thread(get_image_orientation, image_data)
@@ -4113,6 +4198,90 @@ class TelegramWhisperBot:
             logger.error(f"Ошибка при отправке текстового запроса через OpenRouter: {e}", exc_info=True)
             return None
     
+    def _extract_image_bytes_from_openrouter_result(self, result: dict) -> Optional[bytes]:
+        """Извлекает байты изображения из ответа OpenRouter image-модели."""
+        try:
+            if 'choices' not in result or not result['choices']:
+                return None
+
+            choice = result['choices'][0]
+            message = choice.get('message')
+            if not isinstance(message, dict):
+                return None
+
+            if 'images' in message and isinstance(message['images'], list) and message['images']:
+                image_obj = message['images'][0]
+                if isinstance(image_obj, dict) and 'image_url' in image_obj:
+                    image_url = image_obj['image_url'].get('url')
+                    if image_url:
+                        data = self._decode_openrouter_image_url(image_url)
+                        if data:
+                            return data
+
+            content = message.get('content')
+            if isinstance(content, str) and content:
+                if content.startswith('data:image/'):
+                    data = self._decode_openrouter_image_url(content)
+                    if data:
+                        return data
+                if content.startswith('http://') or content.startswith('https://'):
+                    return self._fetch_image_bytes_from_url(content)
+                url_match = re.search(r'(https?://[^\s]+)', content)
+                if url_match:
+                    return self._fetch_image_bytes_from_url(url_match.group(1))
+
+            data_result = result.get('data')
+            if isinstance(data_result, list) and data_result:
+                url = data_result[0].get('url') if isinstance(data_result[0], dict) else None
+                if url:
+                    if url.startswith('data:image/'):
+                        return self._decode_openrouter_image_url(url)
+                    return self._fetch_image_bytes_from_url(url)
+
+            return None
+        except Exception as e:
+            logger.warning(f"Не удалось извлечь изображение из ответа OpenRouter: {e}")
+            return None
+
+    def _decode_openrouter_image_url(self, image_url: str) -> Optional[bytes]:
+        if not image_url.startswith('data:image/'):
+            return None
+        match = re.match(r'data:image/(\w+);base64,(.+)', image_url)
+        if not match:
+            return None
+        try:
+            return base64.b64decode(match.group(2))
+        except Exception as e:
+            logger.warning(f"Ошибка декодирования base64 изображения: {e}")
+            return None
+
+    def _fetch_image_bytes_from_url(self, url: str) -> Optional[bytes]:
+        try:
+            response = requests.get(url, timeout=60)
+            if response.status_code == 200 and response.content:
+                return response.content
+            logger.warning(f"Не удалось загрузить изображение по URL: HTTP {response.status_code}")
+            return None
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки изображения по URL: {e}")
+            return None
+
+    def _openrouter_result_is_text_only(self, result: dict) -> bool:
+        try:
+            message = result.get('choices', [{}])[0].get('message', {})
+            if message.get('images'):
+                return False
+            content = message.get('content')
+            if isinstance(content, str) and content and not content.startswith('data:image/'):
+                if content.startswith('http://') or content.startswith('https://'):
+                    return False
+                if re.search(r'https?://[^\s]+', content):
+                    return False
+                return True
+            return False
+        except Exception:
+            return False
+
     def _check_api_response_error(self, result: dict):
         """Проверяет ответ API на наличие ошибок в native_finish_reason
         
